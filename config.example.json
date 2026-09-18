@@ -1,0 +1,8 @@
+{
+  "aircraft": [
+    {"id": 1, "host": "192.168.11.1", "user": "icaa", "password": ""},
+    {"id": 2, "host": "192.168.11.2", "user": "icaa01", "password": ""},
+    {"id": 3, "host": "192.168.11.3", "user": "pc", "password": ""}
+  ],
+  "waypoints": {"1": [], "2": [], "3": []}
+}
