@@ -329,7 +329,7 @@ class Handler(socketserver.StreamRequestHandler):
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('action',choices=['serve','request'])
-    parser.add_argument('--aircraft',type=int,choices=[1,2,3])
+    parser.add_argument('--aircraft',type=int,choices=range(1,8))
     args=parser.parse_args()
     if args.action=='request':
         import sys

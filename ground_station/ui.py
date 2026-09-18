@@ -93,17 +93,17 @@ class Window(W.QMainWindow):
         self.resize(1380,940)
         central=W.QWidget();self.setCentralWidget(central);layout=W.QVBoxLayout(central);layout.setContentsMargins(24,20,24,18);layout.setSpacing(14)
         top=W.QHBoxLayout();title=W.QLabel('FAST DRONE  /  地面站');title.setObjectName('title');top.addWidget(title);top.addStretch()
-        badge=W.QLabel('● 模拟演示 · 不连接飞机' if demo else '● 实机 · 1 / 2 / 3 独立运行');badge.setObjectName('badge');top.addWidget(badge);layout.addLayout(top)
+        badge=W.QLabel('● 模拟演示 · 不连接飞机' if demo else '● 实机 · '+str(len(config['aircraft']))+' 架独立运行');badge.setObjectName('badge');top.addWidget(badge);layout.addLayout(top)
         desc=W.QLabel('上电 → 启动程序 → 设置各机航点 → 一键执行 → 规划返航 → 自动降落');desc.setObjectName('muted');layout.addWidget(desc)
         self.table=W.QTableWidget(len(config['aircraft']),9)
         self.table.setHorizontalHeaderLabels(['选择','飞机 / SSH','程序 / 链路','本机定位','GNSS','电量','飞行模式 / 解锁','局部位置 x / y / z','任务'])
         self.table.verticalHeader().hide();self.table.setSelectionBehavior(W.QAbstractItemView.SelectRows);self.table.setEditTriggers(W.QAbstractItemView.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(W.QHeaderView.ResizeToContents);self.table.horizontalHeader().setSectionResizeMode(7,W.QHeaderView.Stretch)
-        self.table.setMaximumHeight(195)
+        self.table.setFixedHeight(45+38*len(config['aircraft']))
         for row,a in enumerate(config['aircraft']):
             item=W.QTableWidgetItem();item.setFlags(QtCore.Qt.ItemIsEnabled|QtCore.Qt.ItemIsUserCheckable);item.setCheckState(QtCore.Qt.Checked);self.table.setItem(row,0,item)
             for col in range(1,9):self.table.setItem(row,col,W.QTableWidgetItem('—'))
-            self.table.item(row,1).setText(f"{a['id']} 号  {a['host']}");self.table.setRowHeight(row,45)
+            self.table.item(row,1).setText(f"{a['id']} 号  {a['host']}");self.table.setRowHeight(row,38)
             worker=Worker(a,demo);worker.state.connect(self.on_state);worker.result.connect(self.on_result);self.workers[a['id']]=worker
         layout.addWidget(self.table)
         tools=W.QHBoxLayout();self.buttons={}
