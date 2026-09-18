@@ -10,16 +10,20 @@ class AllCheckBox(W.QCheckBox):
 
 
 class LocalPlot(W.QWidget):
+    clicked=QtCore.pyqtSignal(int)
     def __init__(self,aircraft):
         super().__init__();self.setMinimumSize(180,150)
         self.setSizePolicy(W.QSizePolicy.Expanding,W.QSizePolicy.Expanding)
-        self.aircraft=aircraft;self.state={};self.points=[];self.trace=[]
+        self.aircraft=aircraft;self.selected=False;self.setCursor(QtCore.Qt.PointingHandCursor);self.state={};self.points=[];self.trace=[]
+    def mousePressEvent(self,event):
+        if event.button()==QtCore.Qt.LeftButton:self.clicked.emit(self.aircraft)
+        super().mousePressEvent(event)
     def change(self,state,points,trace):
         self.state=state;self.points=points;self.trace=trace;self.update()
     def paintEvent(self,event):
         p=QtGui.QPainter(self);p.setRenderHint(QtGui.QPainter.Antialiasing)
         p.fillRect(self.rect(),QtGui.QColor('#111d2c'))
-        p.setPen(QtGui.QPen(QtGui.QColor('#2d425c'),1));p.drawRect(self.rect().adjusted(0,0,-1,-1))
+        p.setPen(QtGui.QPen(QtGui.QColor('#35d0db' if self.selected else '#2d425c'),2 if self.selected else 1));p.drawRect(self.rect().adjusted(0,0,-1,-1))
         p.setPen(QtGui.QColor('#c5d5e7'));p.drawText(12,23,f'{self.aircraft} 号机 · 局部 map / m')
         local=[(v['a'],v['b']) for v in self.points if v['kind']=='local']
         actual=self.state.get('mission',{}).get('points',[])

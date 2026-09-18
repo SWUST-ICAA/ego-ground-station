@@ -9,6 +9,7 @@ from PyQt5 import QtCore, QtWidgets as W
 from .transport import Remote
 from .demo import Demo
 from .view_widgets import AllCheckBox, MapPanel
+from .waypoint_editor import WaypointEditor
 
 PHASES={'IDLE':'待命','ARMING':'解锁中','TAKEOFF':'起飞中','OUTBOUND':'前往航点','RETURNING':'规划返航',
         'LAND_REQUESTED':'请求降落','LANDING':'降落中','COMPLETE':'任务完成','ERROR':'异常','MANUAL':'外部接管',
@@ -93,21 +94,19 @@ class Window(W.QMainWindow):
         for a in config['aircraft']:self.selector.addItem(f"{a['id']} 号机",a['id'])
         self.selector.currentIndexChanged.connect(self.switch);header.addWidget(self.selector);header.addStretch();ll.addLayout(header)
         self.notice=W.QLabel();self.notice.setWordWrap(True);ll.addWidget(self.notice)
-        self.waypoints=W.QTableWidget(0,3);self.waypoints.setHorizontalHeaderLabels(['坐标类型','X / 纬度','Y / 经度']);self.waypoints.horizontalHeader().setSectionResizeMode(W.QHeaderView.Stretch);ll.addWidget(self.waypoints)
-        self.waypoints.setMinimumHeight(85);self.waypoints.itemChanged.connect(self.save_edits)
-        controls=W.QHBoxLayout()
-        add=W.QPushButton('+ 米制点');add.clicked.connect(lambda:self.add_point('local'));controls.addWidget(add)
-        self.add_geo=W.QPushButton('+ 经纬度点');self.add_geo.clicked.connect(lambda:self.add_point('geo'));controls.addWidget(self.add_geo)
-        delete=W.QPushButton('删除选中点');delete.clicked.connect(self.delete_point);controls.addWidget(delete)
-        ll.addLayout(controls)
+        self.waypoint_editor=WaypointEditor();ll.addWidget(self.waypoint_editor,1)
+        self.waypoint_editor.pointsChanged.connect(self.save_points)
+        self.waypoint_editor.logMessage.connect(self.write_log)
         text=W.QLabel('米制：本机 map 绝对坐标，单位 m。经纬度：WGS84 十进制度。\n航点按顺序执行，最后自动返回起飞点并降落。高度固定 1.5m。');text.setWordWrap(True);text.setObjectName('muted');ll.addWidget(text)
         self.details=W.QLabel('等待遥测');self.details.setWordWrap(True);ll.addWidget(self.details)
-        editor=W.QScrollArea();editor.setWidgetResizable(True);editor.setFrameShape(W.QFrame.NoFrame);editor.setWidget(left);editor.setMinimumSize(250,150)
+        editor=W.QScrollArea();editor.setWidgetResizable(True);editor.setFrameShape(W.QFrame.NoFrame);editor.setWidget(left);editor.setMinimumSize(350,150)
         splitter.addWidget(editor)
         right=W.QWidget();rl=W.QVBoxLayout(right);rl.setContentsMargins(4,0,0,0)
         map_title=W.QLabel('全部飞机 · 独立局部坐标（各机坐标不可直接比较）');map_title.setWordWrap(True);rl.addWidget(map_title)
         self.map_panel=MapPanel([a['id'] for a in config['aircraft']]);rl.addWidget(self.map_panel,1)
-        splitter.addWidget(right);splitter.setStretchFactor(0,0);splitter.setStretchFactor(1,1);splitter.setSizes([320,1200])
+        for n,plot in self.map_panel.plots.items():plot.clicked.connect(self.select_aircraft)
+        self.table.cellClicked.connect(lambda row,col:self.select_aircraft(self.config['aircraft'][row]['id']) if col else None)
+        splitter.addWidget(right);splitter.setStretchFactor(0,0);splitter.setStretchFactor(1,1);splitter.setSizes([460,1060])
         self.log=W.QPlainTextEdit();self.log.setReadOnly(True);self.log.setMinimumHeight(50);self.log.document().setMaximumBlockCount(300);self.main_splitter.addWidget(self.log)
         self.main_splitter.setSizes([335,590,90]);self.main_splitter.setStretchFactor(0,1);self.main_splitter.setStretchFactor(1,3);self.main_splitter.setStretchFactor(2,0)
         self.setStyleSheet('''QMainWindow,QWidget{background:#0b1421;color:#dce7f5;font-family:"Noto Sans CJK SC","DejaVu Sans";font-size:13px} QLabel#title{font-size:21px;font-weight:700} QLabel#badge{color:#39d0ca;background:#142b35;border-radius:6px;padding:9px} QLabel#muted{color:#8297af} QPushButton{background:#1b2a40;border:1px solid #2d425c;border-radius:6px;padding:10px 14px} QPushButton:hover{background:#263b55} QPushButton:disabled{color:#586777;background:#142031} QPushButton#primary{background:#1b938f;color:white;font-weight:bold} QPushButton#danger{background:#69353c;color:#ffdbdf} QTableWidget,QPlainTextEdit{background:#101d2c;alternate-background-color:#152436;border:1px solid #25374b;border-radius:5px;gridline-color:#25374b;selection-background-color:#214e63} QHeaderView::section{background:#17283c;color:#9bb2cc;padding:8px;border:0} QComboBox{background:#1b2a40;padding:6px;border:1px solid #30465f;border-radius:4px} QLineEdit{background:#142236} QCheckBox{spacing:7px} QCheckBox::indicator{width:16px;height:16px} QSplitter::handle{background:#30465f;width:5px;height:5px} QScrollArea{border:0}''')
@@ -151,46 +150,19 @@ class Window(W.QMainWindow):
         fd=os.open(str(temporary),os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
         with os.fdopen(fd,'w') as f:json.dump(self.config,f,ensure_ascii=False,indent=2)
         os.replace(temporary,self.path);os.chmod(self.path,0o600)
-    def save_edits(self,*args):
-        if self.loading:return
-        result=[]
-        try:
-            import math
-            for row in range(self.waypoints.rowCount()):
-                a=float(self.waypoints.item(row,1).text());b=float(self.waypoints.item(row,2).text())
-                if not math.isfinite(a+b):raise ValueError()
-                result.append(dict(kind=self.waypoints.item(row,0).data(QtCore.Qt.UserRole),a=a,b=b))
-        except (ValueError,AttributeError):
-            self.notice.setText('坐标输入无效，尚未保存；请填写有限数值。');return False
-        self.config['waypoints'][str(self.current)]=result;self.persist();return True
+    def save_points(self,points):
+        self.config.setdefault('waypoints',{})[str(self.current)]=points;self.persist();self.refresh_detail()
     def load_points(self):
-        self.loading=True;self.waypoints.setRowCount(0)
-        for point in self.points(self.current):
-            row=self.waypoints.rowCount();self.waypoints.insertRow(row)
-            item=W.QTableWidgetItem('米制 map' if point['kind']=='local' else '经纬度 WGS84');item.setData(QtCore.Qt.UserRole,point['kind']);item.setFlags(QtCore.Qt.ItemIsEnabled|QtCore.Qt.ItemIsSelectable);self.waypoints.setItem(row,0,item)
-            self.waypoints.setItem(row,1,W.QTableWidgetItem(str(point['a'])));self.waypoints.setItem(row,2,W.QTableWidgetItem(str(point['b'])))
-        self.loading=False;self.refresh_detail()
-    def switch(self):self.current=self.selector.currentData();self.load_points()
-    def add_point(self,kind):
-        if self.save_edits() is False:return
-        state=self.states.get(self.current,{})
-        if kind=='geo':
-            gps=state.get('gps')
-            if not self.geo_available(self.current):return
-            a,b=gps['latitude'],gps['longitude']
-        else:
-            pos=state.get('position') or [0,0,0];a,b=round(pos[0]+2,2),round(pos[1],2)
-        self.points(self.current).append(dict(kind=kind,a=a,b=b));self.persist();self.load_points()
-    def delete_point(self):
-        row=self.waypoints.currentRow()
-        if row>=0:self.points(self.current).pop(row);self.persist();self.load_points()
+        self.waypoint_editor.set_aircraft(self.current,self.points(self.current));self.refresh_detail()
+    def switch(self):
+        self.current=self.selector.currentData();self.load_points()
+    def select_aircraft(self,n):
+        self.selector.setCurrentIndex(self.selector.findData(n))
     def batch(self,command):
-        if self.save_edits() is False:
-            W.QMessageBox.warning(self,'坐标无效','请修正当前表格中的坐标后再操作。');return
         ids=self.selected()
-        if not ids:return
+        if not ids:self.write_log('未选择飞机，未提交操作。');return
         if any(self.workers[n].pending for n in ids):
-            W.QMessageBox.information(self,'操作处理中','选中的飞机尚有操作未完成，请等待状态更新。');return
+            self.write_log('选中的飞机尚有操作未完成，请等待状态更新。');return
         if command=='start':
             errors=[]
             for n in ids:
@@ -198,21 +170,22 @@ class Window(W.QMainWindow):
                 if time.monotonic()-self.received.get(n,0)>3 or not s.get('online',False) or not s.get('ready'):errors.append(f'{n} 号：状态未就绪')
                 if not self.points(n):errors.append(f'{n} 号：未设置航点')
                 if any(p['kind']=='geo' for p in self.points(n)) and not s.get('geo_ready'):errors.append(f'{n} 号：经纬度不可用，改用米制点')
-            if errors:W.QMessageBox.warning(self,'不能执行任务','\n'.join(errors));return
+            if errors:self.write_log('不能执行任务：'+'；'.join(errors));return
         if command in {'start','return','land','stop_program'}:
             detail={'start':'请求解锁并起飞，按各机航点飞行，然后规划返航并自动降落。','return':'取消后续航点，通过规划器返回各自起飞点并降落。','land':'在当前位置请求 AUTO.LAND，取消当前任务。','stop_program':'仅关闭已着陆且未解锁的飞机程序。'}[command]
-            if W.QMessageBox.question(self,'确认操作',f"飞机：{', '.join(map(str,ids))}\n{detail}",W.QMessageBox.Yes|W.QMessageBox.No,W.QMessageBox.No)!=W.QMessageBox.Yes:return
+            self.write_log(f"飞机 {ids}：{detail}")
         for n in ids:
             params=dict(waypoints=list(self.points(n))) if command=='start' else {}
             self.workers[n].submit(command,params)
             self.write_log(f'{n} 号 · 已提交 {command}；各机独立接受/拒绝，非同步起飞保证')
     def on_result(self,n,command,ok,text):
         self.write_log(f'{n} 号 · {command} '+('成功' if ok else '失败')+'：'+text)
-        if not ok:W.QMessageBox.warning(self,f'{n} 号操作失败',text)
     def on_state(self,n,state):
         if 'online' not in state:state['online']=True
         if not state.get('online'):
             state=dict(self.states.get(n,{}),**state,ready=False,fresh=False,geo_ready=False)
+        if state.get('error') and state.get('error')!=self.states.get(n,{}).get('error'):
+            self.write_log(f"{n} 号 · {state['error']}")
         self.states[n]=state;self.received[n]=time.monotonic()
         row=next(i for i,a in enumerate(self.config['aircraft']) if a['id']==n)
         p=state.get('position');mode=state.get('mode','—');phase=state.get('mission',{}).get('phase','—')
@@ -244,7 +217,7 @@ class Window(W.QMainWindow):
             n=a['id']
             self.table.item(row,4).setText('经纬度可用' if self.geo_available(n) else '仅米制目标 · 持续检测')
         s=self.states.get(self.current,{});fresh=time.monotonic()-self.received.get(self.current,0)<3
-        geo=self.geo_available(self.current);self.add_geo.setEnabled(geo)
+        geo=self.geo_available(self.current);self.waypoint_editor.set_status(s,fresh,geo)
         self.notice.setText('经纬度和米制坐标均可设置。' if geo else '持续检测 GNSS 与坐标参考，可用后自动开放经纬度点；当前可设置米制点。')
         m=s.get('mission',{});gps=s.get('gps');parts=[]
         if not fresh:parts.append('遥测未更新，请等待连接')
@@ -254,10 +227,11 @@ class Window(W.QMainWindow):
         parts.append(f"任务：{PHASES.get(m.get('phase'),m.get('phase','—'))}  |  航点 {min(m.get('index',0)+1,len(m.get('points',[])))}/{len(m.get('points',[]))}")
         if m.get('reason'):parts.append(m['reason'])
         self.details.setText('\n'.join(parts))
-        for n,plot in self.map_panel.plots.items():plot.change(self.states.get(n,{}),self.points(n),self.traces[n])
+        for n,plot in self.map_panel.plots.items():
+            plot.selected=n==self.current;plot.change(self.states.get(n,{}),self.points(n),self.traces[n])
     def closeEvent(self,event):
         active=[n for n,s in self.states.items() if s.get('mission',{}).get('active')]
-        if active and W.QMessageBox.question(self,'机上任务仍在执行','关闭界面不会停止机上任务，飞机仍会按任务返航降落。确认关闭？',W.QMessageBox.Yes|W.QMessageBox.No,W.QMessageBox.No)!=W.QMessageBox.Yes:event.ignore();return
+        if active:self.write_log(f'关闭界面；飞机 {active} 的机上任务仍会继续执行。')
         self.timer.stop()
         for worker in self.workers.values():worker.halt.set();worker.backend.close()
         for worker in self.workers.values():

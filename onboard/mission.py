@@ -35,8 +35,6 @@ class Mission:
         pos = [float(x) for x in state['position']]
         if len(pos) != 3 or not all(math.isfinite(x) for x in pos):
             raise ValueError('本机位置无效')
-        if abs(pos[2]) > .15:
-            raise ValueError('起飞点局部 z 偏离零超过 0.15m，与固定 1.5m 规划高度不一致')
         validated = []
         if not isinstance(points, list) or not 1 <= len(points) <= 50:
             raise ValueError('航点数量应为 1～50')
