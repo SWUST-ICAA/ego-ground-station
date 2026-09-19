@@ -8,7 +8,7 @@ import time
 from PyQt5 import QtCore, QtWidgets as W
 from .transport import Remote
 from .demo import Demo
-from .view_widgets import AllCheckBox, MapPanel
+from .view_widgets import AllCheckBox, MapPanel, SelectCheckBox
 from .waypoint_editor import WaypointEditor
 
 PHASES={'IDLE':'待命','ARMING':'解锁中','TAKEOFF':'起飞中','OUTBOUND':'前往航点','RETURNING':'规划返航',
@@ -23,7 +23,7 @@ class Worker(QtCore.QThread):
         super().__init__();self.n=config['id'];self.backend=Demo(config) if demo else Remote(config)
         self.commands=queue.Queue();self.halt=threading.Event();self.pending=False
     def submit(self,command,params=None):
-        if self.pending:return False
+        if self.pending or not self.isRunning():return False
         self.pending=True;self.commands.put((command,params or {}));return True
     def run(self):
         last_poll=0
@@ -44,6 +44,7 @@ class Worker(QtCore.QThread):
                 except Exception as e:
                     self.backend.close()
                     self.state.emit(self.n,dict(online=False,error=str(e)))
+                    break
                 last_poll=time.monotonic()
         self.backend.close()
 
@@ -60,7 +61,7 @@ class Window(W.QMainWindow):
         central=W.QWidget();self.setCentralWidget(central);layout=W.QVBoxLayout(central);layout.setContentsMargins(16,12,16,12);layout.setSpacing(10)
         top=W.QHBoxLayout();title=W.QLabel('FAST DRONE  /  地面站');title.setObjectName('title');top.addWidget(title);top.addStretch()
         badge=W.QLabel('● 模拟演示 · 不连接飞机' if demo else '● 实机 · '+str(len(config['aircraft']))+' 架独立运行');badge.setObjectName('badge');top.addWidget(badge);layout.addLayout(top)
-        desc=W.QLabel('上电 → 启动程序 → 设置各机航点 → 一键执行 → 规划返航 → 自动降落');desc.setObjectName('muted');desc.setWordWrap(True);layout.addWidget(desc)
+        desc=W.QLabel('上电 → 连接 SSH → 启动程序 → 设置各机航点 → 一键执行 → 规划返航 → 自动降落');desc.setObjectName('muted');desc.setWordWrap(True);layout.addWidget(desc)
         self.main_splitter=W.QSplitter(QtCore.Qt.Vertical);self.main_splitter.setChildrenCollapsible(False)
         self.sections_adjusted=False;self.main_splitter.splitterMoved.connect(self.mark_sections_adjusted)
         layout.addWidget(self.main_splitter,1)
@@ -68,21 +69,25 @@ class Window(W.QMainWindow):
         selection=W.QHBoxLayout();self.select_all=AllCheckBox('全选');self.select_all.setTristate(True)
         self.select_all.stateChanged.connect(self.set_all_selected);selection.addWidget(self.select_all)
         self.selection_count=W.QLabel();self.selection_count.setObjectName('muted');selection.addWidget(self.selection_count);selection.addStretch();status_layout.addLayout(selection)
-        self.checkboxes={}
-        self.table=W.QTableWidget(len(config['aircraft']),9)
-        self.table.setHorizontalHeaderLabels(['选择','飞机 / SSH','程序 / 链路','本机定位','GNSS','电量','飞行模式 / 解锁','局部位置 x / y / z','任务'])
+        self.checkboxes={};self.connect_buttons={}
+        self.table=W.QTableWidget(len(config['aircraft']),10)
+        self.table.setHorizontalHeaderLabels(['选择','飞机 / SSH','程序 / 链路','本机定位','GNSS','电量','飞行模式 / 解锁','局部位置 x / y / z','任务','SSH 连接'])
         self.table.verticalHeader().hide();self.table.setSelectionBehavior(W.QAbstractItemView.SelectRows);self.table.setEditTriggers(W.QAbstractItemView.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(W.QHeaderView.ResizeToContents);self.table.horizontalHeader().setSectionResizeMode(7,W.QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(0,W.QHeaderView.Fixed);self.table.setColumnWidth(0,48)
+        self.table.horizontalHeader().setSectionResizeMode(0,W.QHeaderView.Fixed);self.table.setColumnWidth(0,64)
         self.table.setMinimumHeight(85);self.table.setSizePolicy(W.QSizePolicy.Expanding,W.QSizePolicy.Expanding)
         for row,a in enumerate(config['aircraft']):
-            box=W.QCheckBox();box.setChecked(True);box.setAccessibleName(f"选择 {a['id']} 号机")
+            box=SelectCheckBox();box.setChecked(True);box.setAccessibleName(f"选择 {a['id']} 号机")
             box.stateChanged.connect(self.update_selection);self.checkboxes[a['id']]=box
             cell=W.QWidget();cell_layout=W.QHBoxLayout(cell);cell_layout.setContentsMargins(0,0,0,0);cell_layout.setAlignment(QtCore.Qt.AlignCenter);cell_layout.addWidget(box)
             self.table.setCellWidget(row,0,cell)
             for col in range(1,9):self.table.setItem(row,col,W.QTableWidgetItem('—'))
-            self.table.item(row,1).setText(f"{a['id']} 号  {a['host']}");self.table.setRowHeight(row,32)
+            self.table.item(row,1).setText(f"{a['id']} 号  {a['host']}");self.table.setRowHeight(row,44)
             worker=Worker(a,demo);worker.state.connect(self.on_state);worker.result.connect(self.on_result);self.workers[a['id']]=worker
+            n=a['id'];button=W.QPushButton('连接 SSH');button.setStyleSheet('padding:6px 10px')
+            button.clicked.connect(lambda checked=False,n=n:self.connect_aircraft(n));self.connect_buttons[n]=button;self.table.setCellWidget(row,9,button)
+            self.table.item(row,2).setText('未连接')
+            worker.finished.connect(lambda n=n:self.connection_finished(n))
         status_layout.addWidget(self.table,1);self.update_selection()
         self.toolbar=W.QWidget();self.toolbar_grid=W.QGridLayout(self.toolbar);self.toolbar_grid.setContentsMargins(0,0,0,0);self.toolbar_grid.setSpacing(8);self.toolbar_columns=0;self.buttons={}
         for name,label,style in [('start_program','启动选中程序',''),('stop_program','关闭选中程序',''),('start','一键起飞并执行','primary'),('return','选中飞机返航',''),('land','选中飞机就地降落','danger')]:
@@ -111,9 +116,16 @@ class Window(W.QMainWindow):
         self.main_splitter.setSizes([335,590,90]);self.main_splitter.setStretchFactor(0,1);self.main_splitter.setStretchFactor(1,3);self.main_splitter.setStretchFactor(2,0)
         self.setStyleSheet('''QMainWindow,QWidget{background:#0b1421;color:#dce7f5;font-family:"Noto Sans CJK SC","DejaVu Sans";font-size:13px} QLabel#title{font-size:21px;font-weight:700} QLabel#badge{color:#39d0ca;background:#142b35;border-radius:6px;padding:9px} QLabel#muted{color:#8297af} QPushButton{background:#1b2a40;border:1px solid #2d425c;border-radius:6px;padding:10px 14px} QPushButton:hover{background:#263b55} QPushButton:disabled{color:#586777;background:#142031} QPushButton#primary{background:#1b938f;color:white;font-weight:bold} QPushButton#danger{background:#69353c;color:#ffdbdf} QTableWidget,QPlainTextEdit{background:#101d2c;alternate-background-color:#152436;border:1px solid #25374b;border-radius:5px;gridline-color:#25374b;selection-background-color:#214e63} QHeaderView::section{background:#17283c;color:#9bb2cc;padding:8px;border:0} QComboBox{background:#1b2a40;padding:6px;border:1px solid #30465f;border-radius:4px} QLineEdit{background:#142236} QCheckBox{spacing:7px} QCheckBox::indicator{width:16px;height:16px} QSplitter::handle{background:#30465f;width:5px;height:5px} QScrollArea{border:0}''')
         self.adapt_toolbar();self.load_points();self.write_log('模拟演示：2 号机无 GNSS，可用米制航点。' if demo else '启动程序不会解锁；任务在各机独立执行。')
-        for worker in self.workers.values():worker.start()
+        self.write_log('请点击各机的「连接 SSH」；仅连接你需要操作的飞机。')
         self.timer=QtCore.QTimer(self);self.timer.timeout.connect(self.refresh_detail);self.timer.start(500)
 
+    def connect_aircraft(self,n):
+        worker=self.workers[n]
+        if worker.isRunning():return
+        worker.halt.clear();self.connect_buttons[n].setEnabled(False);self.connect_buttons[n].setText('连接中…')
+        self.write_log(f'{n} 号 · 开始连接 SSH');worker.start()
+    def connection_finished(self,n):
+        self.connect_buttons[n].setText('重试连接');self.connect_buttons[n].setEnabled(True)
     def write_log(self,text):self.log.appendPlainText(time.strftime('%H:%M:%S')+'  '+text)
     def selected(self):return [n for n,box in self.checkboxes.items() if box.isChecked()]
     def set_all_selected(self,state):
@@ -133,8 +145,8 @@ class Window(W.QMainWindow):
     def fit_sections(self):
         if self.sections_adjusted:return
         height=self.main_splitter.height()
-        desired=self.table.rowCount()*32+self.table.horizontalHeader().height()+self.toolbar.sizeHint().height()+self.select_all.sizeHint().height()+16
-        top=min(desired,int(height*.4));bottom=min(90,max(50,height//12))
+        desired=self.table.rowCount()*44+self.table.horizontalHeader().height()+self.toolbar.sizeHint().height()+self.select_all.sizeHint().height()+16
+        top=min(desired,int(height*.48));bottom=min(90,max(50,height//12))
         self.main_splitter.setSizes([top,max(150,height-top-bottom-10),bottom])
     def adapt_toolbar(self):
         columns=5 if self.width()>=1150 else 3
@@ -161,6 +173,9 @@ class Window(W.QMainWindow):
     def batch(self,command):
         ids=self.selected()
         if not ids:self.write_log('未选择飞机，未提交操作。');return
+        disconnected=[n for n in ids if not self.workers[n].isRunning() or not self.states.get(n,{}).get('online')]
+        if disconnected:
+            self.write_log(f'未提交操作：飞机 {disconnected} 尚未连接，请先点击对应的连接 SSH 按钮。');return
         if any(self.workers[n].pending for n in ids):
             self.write_log('选中的飞机尚有操作未完成，请等待状态更新。');return
         if command=='start':
@@ -182,6 +197,8 @@ class Window(W.QMainWindow):
         self.write_log(f'{n} 号 · {command} '+('成功' if ok else '失败')+'：'+text)
     def on_state(self,n,state):
         if 'online' not in state:state['online']=True
+        if state.get('online'):
+            self.connect_buttons[n].setText('已连接');self.connect_buttons[n].setEnabled(False)
         if not state.get('online'):
             state=dict(self.states.get(n,{}),**state,ready=False,fresh=False,geo_ready=False)
         if state.get('error') and state.get('error')!=self.states.get(n,{}).get('error'):

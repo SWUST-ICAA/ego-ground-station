@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import json
-import os
 from pathlib import Path
 import sys
 from PyQt5 import QtWidgets
@@ -15,7 +14,7 @@ def main():
     parser.add_argument('--config',type=Path,default=root/'config.local.json')
     args=parser.parse_args()
     if not args.config.exists():
-        args.config.write_text((root/'config.example.json').read_text());os.chmod(args.config,0o600)
+        parser.error('找不到配置文件：'+str(args.config))
     config=json.loads(args.config.read_text())
     aircraft=config.get('aircraft',[])
     ids=[a['id'] for a in aircraft]
@@ -24,7 +23,7 @@ def main():
     if args.demo:
         # Demo edits must not replace flight configuration.
         args.config=root/'logs/demo-config.json';args.config.parent.mkdir(exist_ok=True)
-        config=json.loads((root/'config.example.json').read_text())
+        config=json.loads(json.dumps(config))
         for n in (a['id'] for a in config['aircraft']):config['waypoints'][str(n)]=[dict(kind='local',a=2.,b=float(n-1))]
     app=QtWidgets.QApplication(sys.argv[:1]);app.setApplicationName('Fast Drone Ground Station')
     window=Window(config,args.config,args.demo);window.show();return app.exec_()

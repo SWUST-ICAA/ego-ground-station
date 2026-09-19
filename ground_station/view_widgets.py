@@ -3,7 +3,26 @@ import math
 from PyQt5 import QtCore, QtGui, QtWidgets as W
 
 
-class AllCheckBox(W.QCheckBox):
+class SelectCheckBox(W.QCheckBox):
+    def sizeHint(self):
+        return QtCore.QSize(40+self.fontMetrics().horizontalAdvance(self.text()),36)
+    def hitButton(self,pos):return self.rect().contains(pos)
+    def paintEvent(self,event):
+        p=QtGui.QPainter(self);p.setRenderHint(QtGui.QPainter.Antialiasing)
+        rect=QtCore.QRectF(3,(self.height()-28)/2,28,28)
+        checked=self.checkState()!=QtCore.Qt.Unchecked
+        p.setPen(QtGui.QPen(QtGui.QColor('#ffffff' if self.hasFocus() else '#a9c2da'),2))
+        p.setBrush(QtGui.QColor('#35d0db' if checked else '#17283c'));p.drawRoundedRect(rect,4,4)
+        if checked:
+            p.setPen(QtGui.QPen(QtGui.QColor('#071420'),3,QtCore.Qt.SolidLine,QtCore.Qt.RoundCap,QtCore.Qt.RoundJoin))
+            x,y=rect.x(),rect.y()
+            if self.checkState()==QtCore.Qt.PartiallyChecked:p.drawLine(QtCore.QPointF(x+7,y+14),QtCore.QPointF(x+21,y+14))
+            else:p.drawPolyline(QtGui.QPolygonF([QtCore.QPointF(x+6,y+14),QtCore.QPointF(x+12,y+20),QtCore.QPointF(x+23,y+8)]))
+        p.setPen(QtGui.QColor('#dce7f5'));p.drawText(self.rect().adjusted(40,0,0,0),QtCore.Qt.AlignVCenter,self.text())
+        p.end()
+
+
+class AllCheckBox(SelectCheckBox):
     def nextCheckState(self):
         # Partial is a display state; a click always selects all or clears all.
         self.setCheckState(QtCore.Qt.Unchecked if self.checkState()==QtCore.Qt.Checked else QtCore.Qt.Checked)
