@@ -14,9 +14,10 @@ import threading
 import time
 from geo import to_local
 from mission import Mission
+from visualization import project_cloud, sample_bspline
 
 SOCKET = '/tmp/fast-drone-ground-station.sock'
-VERSION = '1.2.0'
+VERSION = '1.4.0'
 
 
 def request(payload):
@@ -64,6 +65,8 @@ class Agent:
         self.controller = None
         self.controller_log = None
         self.stopping = False
+        self.visual_sub = None
+        self.visual_last_request = 0.0
         self.goal = rospy.Publisher('/move_base_simple/goal', PoseStamped, queue_size=1)
         self.command_pub = rospy.Publisher('/ground_station/position_cmd', PositionCommand, queue_size=1)
         rospy.Subscriber('/position_cmd', PositionCommand, self.cmd_cb, queue_size=1)
@@ -127,11 +130,50 @@ class Agent:
         with self.data_lock:
             return self._snapshot()
 
+    def observe(self):
+        """Return a bounded view of ROS planner data; this cannot command the aircraft."""
+        from sensor_msgs.msg import PointCloud2
+        from sensor_msgs import point_cloud2
+        now = time.monotonic()
+        with self.data_lock:
+            self.visual_last_request = now
+            if self.visual_sub is None:
+                self.visual_sub = self.rospy.Subscriber(
+                    '/drone_0_ego_planner_node/grid_map/occupancy_inflate', PointCloud2,
+                    lambda msg:self.store('inflated_map', msg), queue_size=1)
+            cloud = self.data.get('inflated_map')
+            traj = self.data.get('traj')
+            odom = self.data.get('odom')
+        position = None
+        if odom and now-odom[1] < 1:
+            p = odom[0].pose.pose.position
+            if all(math.isfinite(v) for v in (p.x,p.y,p.z)):
+                position = [p.x,p.y,p.z]
+        map_age = round(now-cloud[1], 2) if cloud else None
+        traj_age = round(now-traj[1], 2) if traj else None
+        points = []
+        if position and cloud and map_age <= 2:
+            raw = point_cloud2.read_points(cloud[0], field_names=('x','y','z'), skip_nans=True)
+            points = project_cloud(raw, position[:2])
+        curve = []
+        if traj and traj_age <= 2 and traj[0].order == 3:
+            msg = traj[0]
+            curve = sample_bspline([(p.x,p.y,p.z) for p in msg.pos_pts], list(msg.knots))
+        return dict(position=position, inflated=points, trajectory=curve,
+                    map_age_sec=map_age, traj_age_sec=traj_age,
+                    map_frame=cloud[0].header.frame_id if cloud else None,
+                    source_points=cloud[0].width*cloud[0].height if cloud else 0)
+
     def _snapshot(self):
         now = time.monotonic()
         def get(key, age):
             pair = self.data.get(key)
             return pair[0] if pair and now-pair[1] <= age else None
+        source_age_sec = {key: round(max(0., now-self.data[key][1]), 2) if key in self.data else None
+                          for key in ('state', 'extended', 'odom', 'bridge', 'cloud')}
+        raw_odom = self.data.get('odom')
+        if raw_odom:
+            source_age_sec['odom_header'] = round((self.rospy.Time.now()-raw_odom[0].header.stamp).to_sec(), 2)
         state, ext, odom = get('state',2), get('extended',3), get('odom',.8)
         pos, speed, yaw = None, None, None
         velocity=None
@@ -145,8 +187,11 @@ class Agent:
                 yaw=math.atan2(2*(q.w*q.z+q.x*q.y),norm-2*(q.y*q.y+q.z*q.z))
         bridge = get('bridge',2)
         try:
-            bridge_ready = bool(bridge and json.loads(bridge.data).get('ready'))
+            last_bridge = self.data.get('bridge')
+            bridge_status = json.loads(last_bridge[0].data) if last_bridge else {}
+            bridge_ready = bool(bridge and bridge_status.get('ready'))
         except (ValueError,TypeError):
+            bridge_status = {}
             bridge_ready=False
         cloud=get('cloud',2)
         points=cloud.width*cloud.height if cloud else 0
@@ -197,10 +242,11 @@ class Agent:
         if batt and math.isfinite(batt.percentage) and 0<=batt.percentage<=1:
             battery=round(batt.percentage*100,1)
         return dict(aircraft=self.aircraft,version=VERSION,session_id=self.session_id,connected=bool(state and state.connected),fresh=fresh,
-                    ready=ready,reasons=reasons,armed=bool(state and state.armed),landed=bool(ext and ext.landed_state==1),
+                    ready=ready,reasons=reasons,source_age_sec=source_age_sec,bridge_reason=bridge_status.get('reason'),
+                    armed=bool(state and state.armed),landed=bool(ext and ext.landed_state==1),
                     mode=state.mode if state else 'UNKNOWN',position=pos,speed=speed,yaw=yaw,battery=battery,
                     voltage=batt.voltage if batt and math.isfinite(batt.voltage) else None,
-                    capabilities=['fence-v1','flight-v2'],geo_anchor=dict(self.anchor) if self.anchor else None,velocity=velocity,
+                    capabilities=['fence-v1','flight-v2','planner-view-v1','telemetry-stream-v1'],geo_anchor=dict(self.anchor) if self.anchor else None,velocity=velocity,
                     command_age=max(0.,now-self.last_forwarded),
                     gps=gps_info,geo_ready=bool(gps_valid and self.anchor and heading and pos),
                     bridge_ready=bridge_ready,cloud_points=points,controller='/px4_controller' in node_set,
@@ -277,6 +323,7 @@ class Agent:
             except Exception as e:self.log('降落请求异常：'+str(e))
 
     def command(self, req):
+        if req.get('command')=='observe':return dict(ok=True,observation=self.observe())
         with self.lock:
             command=req.get('command')
             if command=='status':return dict(ok=True,status=self.snapshot())
@@ -334,6 +381,10 @@ class Agent:
         last_nodes=0
         while not self.rospy.is_shutdown():
             now=time.monotonic()
+            with self.data_lock:
+                if self.visual_sub is not None and now-self.visual_last_request>5:
+                    self.visual_sub.unregister();self.visual_sub=None
+                    self.data.pop('inflated_map',None)
             if now-last_nodes>1:
                 try:
                     graph=rosgraph.Master('/ground_station_agent').getSystemState()
@@ -372,13 +423,30 @@ class Handler(socketserver.StreamRequestHandler):
 
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument('action',choices=['serve','request'])
+    parser.add_argument('action',choices=['serve','request','stream'])
     parser.add_argument('--aircraft',type=int,choices=range(1,8))
+    parser.add_argument('--kind',choices=['status','observe'])
+    parser.add_argument('--period',type=float,default=.2)
     args=parser.parse_args()
     if args.action=='request':
         import sys
         print(json.dumps(request(json.load(sys.stdin)),allow_nan=False))
         return
+    if args.action=='stream':
+        import sys
+        if args.kind is None or not .15<=args.period<=2.0:
+            parser.error('stream requires --kind and 0.15 <= --period <= 2.0')
+        while True:
+            started=time.monotonic()
+            try:
+                reply=request(dict(command=args.kind))
+                print(json.dumps(reply,allow_nan=False),flush=True)
+            except BrokenPipeError:
+                return
+            except Exception as error:
+                print(str(error),file=sys.stderr)
+                return
+            time.sleep(max(0.,args.period-(time.monotonic()-started)))
     if args.aircraft is None:parser.error('--aircraft required')
     lock=open('/tmp/fast-drone-ground-station.lock','w')
     try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)

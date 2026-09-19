@@ -11,9 +11,12 @@ class Demo:
         self.s=dict(aircraft=config['id'],program=False,connected=False,ready=False,fresh=True,armed=False,
                     landed=True,position=[0.,0.,0.],speed=0.,mode='AUTO.LOITER',controller=False,traj_seq=0,
                     battery=92.,voltage=24.1,bridge_ready=True,cloud_points=180,geo_ready=config['id']!=2,
-                    yaw=0.,command_age=0.,capabilities=['fence-v1','flight-v2'],geo_anchor=dict(lat=30.,lon=104.,alt=500.,x=0.,y=0.,rotation=0.) if config['id']!=2 else None,
+                    yaw=0.,command_age=0.,capabilities=['fence-v1','flight-v2','planner-view-v1'],geo_anchor=dict(lat=30.,lon=104.,alt=500.,x=0.,y=0.,rotation=0.) if config['id']!=2 else None,
                     gps=dict(latitude=30.,longitude=104.,altitude=500.) if config['id']!=2 else None,events=[],reasons=[])
     def close(self):pass
+    def observe(self):
+        return dict(position=self.s['position'],inflated=[],trajectory=[],map_age_sec=None,
+                    traj_age_sec=None,map_frame='world',source_points=0)
     def actions(self,actions):
         for action,val in actions:
             if action=='controller_start':self.s['controller']=True

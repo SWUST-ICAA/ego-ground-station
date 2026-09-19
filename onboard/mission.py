@@ -194,7 +194,12 @@ class Mission:
             self.transition('MANUAL', now, '飞行模式已改变，停止任务，不自动抢回控制')
             return [('controller_stop', None)]
         if not fresh or not state.get('ready'):
-            self.transition('LAND_REQUESTED', now, '本机定位/传感器/飞控数据失效，请求就地降落')
+            reason = '本机定位/传感器/飞控数据失效，请求就地降落：' + ','.join(state.get('reasons') or ['未分类失效'])
+            ages = state.get('source_age_sec') or {}
+            delays = ','.join('%s=%.2fs' % (key, value) for key, value in ages.items() if value is not None)
+            if delays:reason += '；延迟 ' + delays
+            if state.get('bridge_reason'):reason += '；定位桥=' + str(state['bridge_reason'])
+            self.transition('LAND_REQUESTED', now, reason)
             return [('land', None)]
         fault=self.fence_fault(state)
         if fault:

@@ -13,6 +13,29 @@ ENTRY='/fast_drone_ws/deploy/entrypoint.sh'
 AGENT='/tmp/ground_station/agent.py'
 
 
+class RemoteStream:
+    """Incremental JSON lines from one long-lived SSH channel."""
+    def __init__(self,channel):
+        self.channel=channel;self.buffer=b''
+
+    def poll(self):
+        while self.channel.recv_ready():
+            self.buffer+=self.channel.recv(65536)
+            if len(self.buffer)>1048576:raise RuntimeError('遥测数据帧过大')
+        replies=[]
+        while b'\n' in self.buffer:
+            line,self.buffer=self.buffer.split(b'\n',1)
+            if line:replies.append(json.loads(line))
+        if not replies and self.channel.exit_status_ready():
+            err=b''
+            while self.channel.recv_stderr_ready():err+=self.channel.recv_stderr(4096)
+            raise RuntimeError(err.decode(errors='replace')[-300:] or '遥测数据流已结束')
+        return replies
+
+    def close(self):
+        self.channel.close()
+
+
 class Remote:
     def __init__(self, config):
         self.config=config
@@ -49,12 +72,12 @@ class Remote:
 
     def rpc(self, command, **params):
         payload=dict(command=command,**params)
-        if command!='status':payload['id']=uuid.uuid4().hex
+        if command not in {'status','observe'}:payload['id']=uuid.uuid4().hex
         try:
             out=self.shell('docker exec -i '+CONTAINER+' '+ENTRY+' python3 '+AGENT+' request',json.dumps(payload,allow_nan=False),timeout=25)
             result=json.loads(out)
         except Exception as e:
-            if command not in {'status','prepare'}:
+            if command not in {'status','prepare','observe'}:
                 raise RuntimeError('命令结果未确认，请刷新状态；不会自动重发：'+str(e)) from e
             raise
         if not result.get('ok'):raise RuntimeError(result.get('error','操作失败'))
@@ -69,6 +92,18 @@ class Remote:
             if 'No such file' in str(e) or 'Connection refused' in str(e):
                 return dict(program=True,connected=False,ready=False,mission=dict(phase='NO_AGENT'),reasons=['点击启动程序以加载观测代理'])
             raise
+
+    def open_stream(self,kind,period):
+        if kind not in {'status','observe'} or not .15<=period<=2.0:
+            raise ValueError('无效的数据流参数')
+        self.connect()
+        command=('docker exec '+CONTAINER+' '+ENTRY+' python3 -u '+AGENT+
+                 ' stream --kind '+kind+' --period '+str(period))
+        _,out,_=self.client.exec_command(command,timeout=10)
+        return RemoteStream(out.channel)
+
+    def observe(self):
+        return self.rpc('observe')['observation']
 
     def start_program(self):
         try:running=self.shell("docker inspect -f '{{.State.Running}}' "+CONTAINER).strip()
@@ -90,11 +125,11 @@ class Remote:
         self.shell('mkdir -p '+shlex.quote(destination))
         sftp=self.client.open_sftp()
         try:
-            for name in ('agent.py','mission.py','geo.py','fence.py'):
+            for name in ('agent.py','mission.py','geo.py','fence.py','visualization.py'):
                 sftp.put(str(ROOT/'onboard'/name),destination+'/'+name)
         finally:sftp.close()
         self.shell('docker exec '+CONTAINER+' mkdir -p /tmp/ground_station')
-        for name in ('agent.py','mission.py','geo.py','fence.py'):
+        for name in ('agent.py','mission.py','geo.py','fence.py','visualization.py'):
             self.shell('docker cp '+shlex.quote(destination+'/'+name)+' '+CONTAINER+':/tmp/ground_station/'+name)
         self.shell('docker exec -d '+CONTAINER+' '+ENTRY+' python3 '+AGENT+' serve --aircraft '+str(int(self.config['id'])))
         for attempt in range(15):

@@ -1,6 +1,7 @@
 """Native PyQt ground station. Each worker owns exactly one SSH connection."""
 import json
 import os
+from collections import deque
 from pathlib import Path
 import queue
 import threading
@@ -9,6 +10,7 @@ from PyQt5 import QtCore, QtWidgets as W
 from .transport import Remote
 from .demo import Demo
 from .view_widgets import AllCheckBox, MapPanel, SelectCheckBox, StatusTable
+from .planner_view import PlannerView
 from .waypoint_editor import WaypointEditor
 from .site_widget import SiteWidget
 from .site import build_plan
@@ -22,41 +24,95 @@ PHASES={'IDLE':'待命','ARMING':'解锁中','TAKEOFF':'起飞中','OUTBOUND':'�
 class Worker(QtCore.QThread):
     state=QtCore.pyqtSignal(int,dict)
     result=QtCore.pyqtSignal(int,str,bool,str)
+    observation=QtCore.pyqtSignal(int,dict)
     def __init__(self,config,demo):
         super().__init__();self.n=config['id'];self.backend=Demo(config) if demo else Remote(config)
-        self.commands=queue.Queue();self.halt=threading.Event();self.pending=False
+        self.commands=queue.Queue();self.halt=threading.Event();self.pending=False;self.observe_enabled=False
     def submit(self,command,params=None):
         if self.pending or not self.isRunning():return False
         self.pending=True;self.commands.put((command,params or {}));return True
     def run(self):
-        last_poll=0
-        while not self.halt.is_set():
-            try:command,params=self.commands.get(timeout=.1)
-            except queue.Empty:command=None
-            if command:
-                try:
-                    state=self.backend.execute(command,**params)
-                    self.state.emit(self.n,state);self.result.emit(self.n,command,True,'完成')
-                except Exception as e:self.result.emit(self.n,command,False,str(e))
-                finally:self.pending=False
-                last_poll=0
-            if time.monotonic()-last_poll>.7 and not self.halt.is_set():
-                try:
-                    state=self.backend.status();state['online']=True
-                    self.state.emit(self.n,state)
-                except Exception as e:
-                    self.backend.close()
-                    self.state.emit(self.n,dict(online=False,error=str(e)))
-                    break
-                last_poll=time.monotonic()
-        self.backend.close()
+        last_poll=0;last_observe=0;last_stream_try=0;last_observe_stream_try=0;latest={}
+        status_stream=None;observe_stream=None
+        try:
+            while not self.halt.is_set():
+                try:command,params=self.commands.get(timeout=.025)
+                except queue.Empty:command=None
+                if command:
+                    try:
+                        state=self.backend.execute(command,**params)
+                        state.setdefault('program',command!='stop_program')
+                        state['online']=True;latest=state
+                        self.state.emit(self.n,state);self.result.emit(self.n,command,True,'完成')
+                    except Exception as e:self.result.emit(self.n,command,False,str(e))
+                    finally:self.pending=False
+                    if command in {'start_program','stop_program'}:
+                        if status_stream:status_stream.close();status_stream=None
+                        if observe_stream:observe_stream.close();observe_stream=None
+                        last_stream_try=0
+                    last_poll=0
+                if (isinstance(self.backend,Remote) and status_stream is None and
+                        (not latest or latest.get('program')) and time.monotonic()-last_stream_try>=2):
+                    last_stream_try=time.monotonic()
+                    try:
+                        status_stream=self.backend.open_stream('status',.2)
+                        last_poll=time.monotonic()
+                    except Exception:pass
+                if status_stream:
+                    try:
+                        replies=status_stream.poll()
+                        for reply in replies:
+                            if not reply.get('ok'):raise RuntimeError(reply.get('error','状态流异常'))
+                            state=dict(reply['status'],program=True,online=True)
+                            latest=state;self.state.emit(self.n,state)
+                            last_poll=time.monotonic()
+                    except Exception:
+                        status_stream.close();status_stream=None
+                if status_stream and time.monotonic()-last_poll>1.5:
+                    status_stream.close();status_stream=None
+                if status_stream is None and time.monotonic()-last_poll>.7 and not self.halt.is_set():
+                    try:
+                        state=self.backend.status();state['online']=True
+                        latest=state;self.state.emit(self.n,state)
+                    except Exception as e:
+                        self.backend.close()
+                        latest['online']=False
+                        self.state.emit(self.n,dict(online=False,error=str(e)))
+                        last_poll=time.monotonic()+1.3
+                    else:last_poll=time.monotonic()
+                observing=(self.observe_enabled and latest.get('online') and latest.get('program') and
+                           'planner-view-v1' in latest.get('capabilities',[]))
+                if not observing and observe_stream:
+                    observe_stream.close();observe_stream=None
+                if (observing and isinstance(self.backend,Remote) and observe_stream is None and
+                        time.monotonic()-last_observe_stream_try>=2):
+                    last_observe_stream_try=time.monotonic()
+                    try:observe_stream=self.backend.open_stream('observe',.4)
+                    except Exception:pass
+                if observe_stream:
+                    try:
+                        for reply in observe_stream.poll():
+                            if not reply.get('ok'):raise RuntimeError(reply.get('error','规划观察流异常'))
+                            self.observation.emit(self.n,reply['observation'])
+                            last_observe=time.monotonic()
+                    except Exception as e:
+                        observe_stream.close();observe_stream=None
+                        self.observation.emit(self.n,dict(error=str(e)))
+                elif observing and not isinstance(self.backend,Remote) and time.monotonic()-last_observe>.4:
+                    try:self.observation.emit(self.n,self.backend.observe())
+                    except Exception as e:self.observation.emit(self.n,dict(error=str(e)))
+                    last_observe=time.monotonic()
+        finally:
+            if status_stream:status_stream.close()
+            if observe_stream:observe_stream.close()
+            self.backend.close()
 
 
 class Window(W.QMainWindow):
     def __init__(self,config,path,demo=False):
         super().__init__();self.config=config;self.path=Path(path);self.demo=demo
         self.states={};self.traces={a['id']:[] for a in config['aircraft']};self.current=config['aircraft'][0]['id']
-        self.workers={};self.event_seen={};self.loading=False;self.received={};self.plans={};self.plan_keys={};self.frames={}
+        self.workers={};self.event_seen={};self.loading=False;self.received={};self.rate_samples={};self.plans={};self.plan_keys={};self.frames={}
         self.setWindowTitle('Fast Drone · 独立单机地面站'+(' [模拟演示]' if demo else ''))
         screen=W.QApplication.primaryScreen().availableGeometry()
         self.resize(min(1680,int(screen.width()*.9)),min(1080,int(screen.height()*.9)))
@@ -84,6 +140,7 @@ class Window(W.QMainWindow):
                 item=W.QTableWidgetItem('—');item.setTextAlignment(QtCore.Qt.AlignCenter if col!=1 else QtCore.Qt.AlignLeft|QtCore.Qt.AlignVCenter);self.table.setItem(row,col,item)
             self.table.item(row,1).setText(f"{a['id']} 号  {a['host']}");self.table.setRowHeight(row,44)
             worker=Worker(a,demo);worker.state.connect(self.on_state);worker.result.connect(self.on_result);self.workers[a['id']]=worker
+            worker.observation.connect(self.on_observation)
             n=a['id'];button=W.QPushButton('连接 SSH');button.setStyleSheet('padding:6px 10px')
             button.clicked.connect(lambda checked=False,n=n:self.connect_aircraft(n));self.connect_buttons[n]=button;self.table.setCellWidget(row,9,button)
             self.table.item(row,2).setText('未连接')
@@ -110,7 +167,11 @@ class Window(W.QMainWindow):
         editor=W.QScrollArea();editor.setWidgetResizable(True);editor.setFrameShape(W.QFrame.NoFrame);editor.setWidget(left);editor.setMinimumSize(350,150)
         splitter.addWidget(editor)
         right=W.QWidget();rl=W.QVBoxLayout(right);rl.setContentsMargins(4,0,0,0)
-        self.map_panel=MapPanel([a['id'] for a in config['aircraft']]);rl.addWidget(self.map_panel,1)
+        self.view_tabs=W.QTabWidget();rl.addWidget(self.view_tabs,1)
+        self.map_panel=MapPanel([a['id'] for a in config['aircraft']]);self.view_tabs.addTab(self.map_panel,'航线总览')
+        self.planner_view=PlannerView();self.planner_view.show_aircraft(self.current)
+        self.view_tabs.addTab(self.planner_view,'局部规划观察')
+        self.view_tabs.currentChanged.connect(self.update_observer)
         for n,plot in self.map_panel.plots.items():plot.clicked.connect(self.select_aircraft)
         self.table.cellClicked.connect(lambda row,col:self.select_aircraft(self.config['aircraft'][row]['id']) if col else None)
         splitter.addWidget(right);splitter.setStretchFactor(0,0);splitter.setStretchFactor(1,1);splitter.setSizes([460,1060])
@@ -119,7 +180,7 @@ class Window(W.QMainWindow):
         self.setStyleSheet('''QMainWindow,QWidget{background:#0b1421;color:#dce7f5;font-family:"Noto Sans CJK SC","DejaVu Sans";font-size:13px} QLabel#title{font-size:21px;font-weight:700} QLabel#badge{color:#39d0ca;background:#142b35;border-radius:6px;padding:9px} QLabel#muted{color:#8297af} QPushButton{background:#1b2a40;border:1px solid #2d425c;border-radius:6px;padding:10px 14px} QPushButton:hover{background:#263b55} QPushButton:disabled{color:#586777;background:#142031} QPushButton#primary{background:#1b938f;color:white;font-weight:bold} QPushButton#danger{background:#69353c;color:#ffdbdf} QTableWidget,QPlainTextEdit{background:#101d2c;alternate-background-color:#152436;border:1px solid #25374b;border-radius:5px;gridline-color:#25374b;selection-background-color:#214e63} QHeaderView::section{background:#17283c;color:#9bb2cc;padding:8px;border:0} QComboBox{background:#1b2a40;padding:6px;border:1px solid #30465f;border-radius:4px} QLineEdit{background:#142236} QCheckBox{spacing:7px} QCheckBox::indicator{width:16px;height:16px} QSplitter::handle{background:#30465f;width:5px;height:5px} QScrollArea{border:0}''')
         self.adapt_toolbar();self.load_points();self.write_log('模拟演示：2 号机无 GNSS，可用米制航点。' if demo else '启动程序不会解锁；任务在各机独立执行。')
         self.write_log('请点击各机的「连接 SSH」；仅连接你需要操作的飞机。')
-        self.timer=QtCore.QTimer(self);self.timer.timeout.connect(self.refresh_detail);self.timer.start(500)
+        self.timer=QtCore.QTimer(self);self.timer.timeout.connect(self.refresh_detail);self.timer.start(200)
 
     def connect_aircraft(self,n):
         worker=self.workers[n]
@@ -170,7 +231,13 @@ class Window(W.QMainWindow):
     def load_points(self):
         self.waypoint_editor.set_aircraft(self.current,self.points(self.current));self.refresh_detail()
     def switch(self):
-        self.current=self.selector.currentData();self.load_points()
+        self.current=self.selector.currentData();self.load_points();self.update_observer()
+    def update_observer(self,*args):
+        viewing=self.view_tabs.currentIndex()==1
+        self.planner_view.show_aircraft(self.current)
+        for n,worker in self.workers.items():worker.observe_enabled=viewing and n==self.current
+    def on_observation(self,n,data):
+        self.planner_view.change(n,data)
     def select_aircraft(self,n):
         self.selector.setCurrentIndex(self.selector.findData(n))
     def site_changed(self):
@@ -226,6 +293,7 @@ class Window(W.QMainWindow):
         if state.get('online'):
             self.connect_buttons[n].setText('已连接');self.connect_buttons[n].setEnabled(False)
         if not state.get('online'):
+            self.connect_buttons[n].setText('自动重连中…')
             state=dict(self.states.get(n,{}),**state,ready=False,fresh=False,geo_ready=False)
         if state.get('error') and state.get('error')!=self.states.get(n,{}).get('error'):
             self.write_log(f"{n} 号 · {state['error']}")
@@ -234,6 +302,10 @@ class Window(W.QMainWindow):
             self.frames.pop(n,None);self.plans.pop(n,None);self.plan_keys.pop(n,None);self.traces[n]=[]
             self.write_log(f'{n} 号 · 机上程序已重启，请重新搜索航线')
         self.states[n]=state;self.received[n]=time.monotonic()
+        samples=self.rate_samples.setdefault(n,deque(maxlen=30))
+        if state.get('online') and state.get('program'):
+            samples.append(self.received[n])
+        else:samples.clear()
         if state.get('program') is False:
             self.frames.pop(n,None);self.plans.pop(n,None);self.plan_keys.pop(n,None);self.traces[n]=[]
         elif state.get('mission',{}).get('active') and state['mission'].get('local_frame'):
@@ -284,6 +356,11 @@ class Window(W.QMainWindow):
         if s.get('error'):parts.append(s['error'][-220:])
         if gps:parts.append(f"GNSS：{gps['latitude']:.7f}, {gps['longitude']:.7f}")
         if m.get('reason'):parts.append(m['reason'])
+        samples=self.rate_samples.get(self.current,())
+        if len(samples)>1 and samples[-1]-samples[0]>0:
+            parts.append(f'地面站遥测刷新：{(len(samples)-1)/(samples[-1]-samples[0]):.1f} Hz')
+        if not s.get('online') and s.get('mission',{}).get('active'):
+            parts.append('地面站连接已断开；机上任务继续执行，请重新连接以查看状态')
         self.details.setText('\n'.join(parts));self.details.setVisible(bool(parts))
         for n,plot in self.map_panel.plots.items():
             state,points,trace,preview=display(self.states.get(n,{}),self.points(n),self.traces[n],self.plans.get(n,{}).get('preview'),self.frames.get(n))
@@ -293,6 +370,7 @@ class Window(W.QMainWindow):
         active=[n for n,s in self.states.items() if s.get('mission',{}).get('active')]
         if active:self.write_log(f'关闭界面；飞机 {active} 的机上任务仍会继续执行。')
         self.timer.stop()
+        for worker in self.workers.values():worker.observe_enabled=False
         for worker in self.workers.values():worker.halt.set();worker.backend.close()
         for worker in self.workers.values():
             if not worker.wait(3000):event.ignore();self.timer.start();return
