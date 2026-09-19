@@ -104,7 +104,6 @@ class Window(W.QMainWindow):
         editor=W.QScrollArea();editor.setWidgetResizable(True);editor.setFrameShape(W.QFrame.NoFrame);editor.setWidget(left);editor.setMinimumSize(350,150)
         splitter.addWidget(editor)
         right=W.QWidget();rl=W.QVBoxLayout(right);rl.setContentsMargins(4,0,0,0)
-        map_title=W.QLabel('全部飞机 · 独立局部坐标（各机坐标不可直接比较）');map_title.setWordWrap(True);rl.addWidget(map_title)
         self.map_panel=MapPanel([a['id'] for a in config['aircraft']]);rl.addWidget(self.map_panel,1)
         for n,plot in self.map_panel.plots.items():plot.clicked.connect(self.select_aircraft)
         self.table.cellClicked.connect(lambda row,col:self.select_aircraft(self.config['aircraft'][row]['id']) if col else None)
@@ -204,7 +203,7 @@ class Window(W.QMainWindow):
         row=next(i for i,a in enumerate(self.config['aircraft']) if a['id']==n)
         p=state.get('position');mode=state.get('mode','—');phase=state.get('mission',{}).get('phase','—')
         values=['在线' if state.get('online') else 'SSH 离线','就绪' if state.get('ready') else '未就绪',
-                '经纬度可用' if state.get('geo_ready') else '仅米制目标',
+                'GNSS有效' if state.get('geo_ready') else 'GNSS无效',
                 f"{state['battery']:.0f}%" if state.get('battery') is not None else '—',
                 mode+(' / 已解锁' if state.get('armed') else ' / 未解锁' if state.get('fresh') else ' / 未知'),
                 ' / '.join(f'{v:.2f}' for v in p) if p else '—',PHASES.get(phase,phase)]
@@ -229,7 +228,7 @@ class Window(W.QMainWindow):
     def refresh_detail(self):
         for row,a in enumerate(self.config['aircraft']):
             n=a['id']
-            self.table.item(row,4).setText('经纬度可用' if self.geo_available(n) else '仅米制目标 · 持续检测')
+            self.table.item(row,4).setText('GNSS有效' if self.geo_available(n) else 'GNSS无效')
         s=self.states.get(self.current,{});fresh=time.monotonic()-self.received.get(self.current,0)<3
         geo=self.geo_available(self.current);self.waypoint_editor.set_status(s,fresh,geo)
         self.notice.setText('经纬度和米制坐标均可设置。' if geo else '持续检测 GNSS 与坐标参考，可用后自动开放经纬度点；当前可设置米制点。')
