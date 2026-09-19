@@ -162,7 +162,7 @@ class Window(W.QMainWindow):
         self.waypoint_editor=WaypointEditor();editor_tabs.insertTab(0,self.waypoint_editor,'目标点');editor_tabs.setCurrentIndex(0)
         self.waypoint_editor.pointsChanged.connect(self.save_points)
         self.waypoint_editor.logMessage.connect(self.write_log)
-        text=W.QLabel('米制：搜索时位置为原点、机头为前，X 向右、Y 向前；飞行中方向固定。经纬度：WGS84。\n移动或转动飞机后请重新搜索航线。最后返回起飞点并降落，高度 1.5m。');text.setWordWrap(True);text.setObjectName('muted');ll.addWidget(text)
+        text=W.QLabel('米制：搜索时位置为原点、机头为前，X 向右、Y 向前；飞行中方向固定。经纬度：WGS84。\n移动或转动飞机后请重新搜索航线。最后返回起飞点并降落，高度 1.2m。');text.setWordWrap(True);text.setObjectName('muted');ll.addWidget(text)
         self.details=W.QLabel('等待遥测');self.details.setWordWrap(True);ll.addWidget(self.details)
         editor=W.QScrollArea();editor.setWidgetResizable(True);editor.setFrameShape(W.QFrame.NoFrame);editor.setWidget(left);editor.setMinimumSize(350,150)
         splitter.addWidget(editor)

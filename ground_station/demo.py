@@ -20,7 +20,7 @@ class Demo:
     def actions(self,actions):
         for action,val in actions:
             if action=='controller_start':self.s['controller']=True
-            elif action=='arm':self.s.update(armed=True,landed=False,mode='OFFBOARD');self.target=[0.,0.,1.5]
+            elif action=='arm':self.s.update(armed=True,landed=False,mode='OFFBOARD');self.target=[0.,0.,1.2]
             elif action=='goal':self.target=list(val);self.s['traj_seq']+=1
             elif action=='land':self.s['mode']='AUTO.LAND';self.target=[*self.s['position'][:2],0.]
             elif action=='controller_stop':self.s['controller']=False

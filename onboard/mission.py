@@ -6,6 +6,7 @@ except ImportError:
     from fence import Fence, xy
 
 TERMINAL = {'IDLE', 'COMPLETE', 'ERROR', 'MANUAL'}
+FLIGHT_HEIGHT = 1.2
 
 
 class Mission:
@@ -50,7 +51,7 @@ class Mission:
             x, y = map(float, point)
             if not math.isfinite(x+y) or not abs(x) < 498.7 or not abs(y) < 498.7:
                 raise ValueError('航点超出当前地图边界（|x|<498.7m，|y|<498.7m）')
-            validated.append([x, y, 1.5])
+            validated.append([x, y, FLIGHT_HEIGHT])
         if abs(pos[0]) >= 498.7 or abs(pos[1]) >= 498.7:
             raise ValueError('起飞点超出规划地图')
         fence=None;returns=[]
@@ -73,17 +74,17 @@ class Mission:
             if not 1<=len(raw)<=50:raise ValueError('返航途经点数量无效')
             for point in raw:
                 if not fence.segment(last,point,.3):raise ValueError('返航航线超出围栏或余量不足')
-                returns.append([float(point[0]),float(point[1]),1.5]);last=point
+                returns.append([float(point[0]),float(point[1]),FLIGHT_HEIGHT]);last=point
             if math.dist(last,pos[:2])>.3:raise ValueError('返航终点与起飞点不一致')
             previous=returns[-2][:2] if len(returns)>1 else validated[-1][:2]
             if not fence.segment(previous,pos[:2],.3):raise ValueError('起飞点不在返航安全区')
-            returns[-1]=[pos[0],pos[1],1.5]
+            returns[-1]=[pos[0],pos[1],FLIGHT_HEIGHT]
         self.fence=fence;self.return_points=returns;self.return_index=0
         self.local_frame=dict(plan['local_frame']) if plan and plan.get('local_frame') else None
         self.skipped=[]
         self.requires_geo=bool(plan and (plan.get('mode')=='competition' or plan.get('geo_anchor')))
-        self.visited=[[pos[0],pos[1],1.5]]
-        self.points, self.home, self.index = validated, [pos[0], pos[1], 1.5], 0
+        self.visited=[[pos[0],pos[1],FLIGHT_HEIGHT]]
+        self.points, self.home, self.index = validated, [pos[0], pos[1], FLIGHT_HEIGHT], 0
         self.seen_offboard = False
         self.transition('ARMING', now)
         return [('controller_start', None), ('arm', None)]
