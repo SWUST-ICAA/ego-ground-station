@@ -103,3 +103,28 @@ class MapPanel(W.QScrollArea):
         rows=math.ceil(len(self.plots)/columns)
         self.body.setMinimumHeight(rows*150+(rows-1)*10)
         self.columns=columns
+
+
+class StatusTable(W.QTableWidget):
+    """Keep telemetry columns readable without one column absorbing all space."""
+    def __init__(self,rows):
+        super().__init__(rows,10)
+        self.horizontalHeader().setSectionResizeMode(W.QHeaderView.Fixed)
+        self.horizontalHeader().setDefaultAlignment(QtCore.Qt.AlignCenter)
+        self.setAlternatingRowColors(True);self.setWordWrap(False)
+        self.viewport().installEventFilter(self)
+
+    def eventFilter(self,obj,event):
+        if obj is self.viewport() and event.type()==QtCore.QEvent.Resize:self.fit_columns()
+        return super().eventFilter(obj,event)
+
+    def fit_columns(self):
+        # Selection/battery stay compact; the other eight columns share spare space.
+        widths=[64,155,110,90,165,70,185,205,110,115]
+        scale=max(1.,self.fontMetrics().height()/19.)
+        widths=[round(w*scale) for w in widths]
+        flexible=[1,2,3,4,6,7,8,9]
+        spare=max(0,self.viewport().width()-sum(widths))
+        each,rest=divmod(spare,len(flexible))
+        for i,col in enumerate(flexible):widths[col]+=each+(i<rest)
+        for col,width in enumerate(widths):self.setColumnWidth(col,width)

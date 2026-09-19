@@ -8,7 +8,7 @@ import time
 from PyQt5 import QtCore, QtWidgets as W
 from .transport import Remote
 from .demo import Demo
-from .view_widgets import AllCheckBox, MapPanel, SelectCheckBox
+from .view_widgets import AllCheckBox, MapPanel, SelectCheckBox, StatusTable
 from .waypoint_editor import WaypointEditor
 
 PHASES={'IDLE':'待命','ARMING':'解锁中','TAKEOFF':'起飞中','OUTBOUND':'前往航点','RETURNING':'规划返航',
@@ -70,18 +70,17 @@ class Window(W.QMainWindow):
         self.select_all.stateChanged.connect(self.set_all_selected);selection.addWidget(self.select_all)
         self.selection_count=W.QLabel();self.selection_count.setObjectName('muted');selection.addWidget(self.selection_count);selection.addStretch();status_layout.addLayout(selection)
         self.checkboxes={};self.connect_buttons={}
-        self.table=W.QTableWidget(len(config['aircraft']),10)
+        self.table=StatusTable(len(config['aircraft']))
         self.table.setHorizontalHeaderLabels(['选择','飞机 / SSH','程序 / 链路','本机定位','GNSS','电量','飞行模式 / 解锁','局部位置 x / y / z','任务','SSH 连接'])
         self.table.verticalHeader().hide();self.table.setSelectionBehavior(W.QAbstractItemView.SelectRows);self.table.setEditTriggers(W.QAbstractItemView.NoEditTriggers)
-        self.table.horizontalHeader().setSectionResizeMode(W.QHeaderView.ResizeToContents);self.table.horizontalHeader().setSectionResizeMode(7,W.QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(0,W.QHeaderView.Fixed);self.table.setColumnWidth(0,64)
         self.table.setMinimumHeight(85);self.table.setSizePolicy(W.QSizePolicy.Expanding,W.QSizePolicy.Expanding)
         for row,a in enumerate(config['aircraft']):
             box=SelectCheckBox();box.setChecked(True);box.setAccessibleName(f"选择 {a['id']} 号机")
             box.stateChanged.connect(self.update_selection);self.checkboxes[a['id']]=box
             cell=W.QWidget();cell_layout=W.QHBoxLayout(cell);cell_layout.setContentsMargins(0,0,0,0);cell_layout.setAlignment(QtCore.Qt.AlignCenter);cell_layout.addWidget(box)
             self.table.setCellWidget(row,0,cell)
-            for col in range(1,9):self.table.setItem(row,col,W.QTableWidgetItem('—'))
+            for col in range(1,9):
+                item=W.QTableWidgetItem('—');item.setTextAlignment(QtCore.Qt.AlignCenter if col!=1 else QtCore.Qt.AlignLeft|QtCore.Qt.AlignVCenter);self.table.setItem(row,col,item)
             self.table.item(row,1).setText(f"{a['id']} 号  {a['host']}");self.table.setRowHeight(row,44)
             worker=Worker(a,demo);worker.state.connect(self.on_state);worker.result.connect(self.on_result);self.workers[a['id']]=worker
             n=a['id'];button=W.QPushButton('连接 SSH');button.setStyleSheet('padding:6px 10px')
@@ -215,7 +214,7 @@ class Window(W.QMainWindow):
         elif phase=='NO_AGENT':values[0]='待加载代理'
         for col,value in enumerate(values,2):
             self.table.item(row,col).setText(value)
-            self.table.item(row,col).setToolTip(state.get('error','')+'\n'+' / '.join(state.get('reasons',[])))
+            self.table.item(row,col).setToolTip(value+'\n'+state.get('error','')+'\n'+' / '.join(state.get('reasons',[])))
         if p:
             trace=self.traces[n]
             if not trace or abs(trace[-1][0]-p[0])+abs(trace[-1][1]-p[1])>.04:trace.append((p[0],p[1]))
