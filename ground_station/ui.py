@@ -233,13 +233,11 @@ class Window(W.QMainWindow):
         geo=self.geo_available(self.current);self.waypoint_editor.set_status(s,fresh,geo)
         self.notice.setText('经纬度和米制坐标均可设置。' if geo else '持续检测 GNSS 与坐标参考，可用后自动开放经纬度点；当前可设置米制点。')
         m=s.get('mission',{});gps=s.get('gps');parts=[]
-        if not fresh:parts.append('遥测未更新，请等待连接')
         parts.extend(s.get('reasons',[]))
         if s.get('error'):parts.append(s['error'][-220:])
         if gps:parts.append(f"GNSS：{gps['latitude']:.7f}, {gps['longitude']:.7f}")
-        parts.append(f"任务：{PHASES.get(m.get('phase'),m.get('phase','—'))}  |  航点 {min(m.get('index',0)+1,len(m.get('points',[])))}/{len(m.get('points',[]))}")
         if m.get('reason'):parts.append(m['reason'])
-        self.details.setText('\n'.join(parts))
+        self.details.setText('\n'.join(parts));self.details.setVisible(bool(parts))
         for n,plot in self.map_panel.plots.items():
             plot.selected=n==self.current;plot.change(self.states.get(n,{}),self.points(n),self.traces[n])
     def closeEvent(self,event):
