@@ -24,7 +24,7 @@ def main():
         # Demo edits must not replace flight configuration.
         args.config=root/'logs/demo-config.json';args.config.parent.mkdir(exist_ok=True)
         config=json.loads(json.dumps(config))
-        for n in (a['id'] for a in config['aircraft']):config['waypoints'][str(n)]=[dict(kind='local',a=2.,b=float(n-1))]
+        for n in (a['id'] for a in config['aircraft']):config['waypoints'][str(n)]=[dict(kind='local',frame='right-forward',a=2.,b=float(n-1))]
     app=QtWidgets.QApplication(sys.argv[:1]);app.setApplicationName('Fast Drone Ground Station')
     window=Window(config,args.config,args.demo);window.show();return app.exec_()
 

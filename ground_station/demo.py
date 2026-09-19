@@ -11,7 +11,7 @@ class Demo:
         self.s=dict(aircraft=config['id'],program=False,connected=False,ready=False,fresh=True,armed=False,
                     landed=True,position=[0.,0.,0.],speed=0.,mode='AUTO.LOITER',controller=False,traj_seq=0,
                     battery=92.,voltage=24.1,bridge_ready=True,cloud_points=180,geo_ready=config['id']!=2,
-                    capabilities=['fence-v1'],geo_anchor=dict(lat=30.,lon=104.,alt=500.,x=0.,y=0.,rotation=0.) if config['id']!=2 else None,
+                    yaw=0.,command_age=0.,capabilities=['fence-v1','flight-v2'],geo_anchor=dict(lat=30.,lon=104.,alt=500.,x=0.,y=0.,rotation=0.) if config['id']!=2 else None,
                     gps=dict(latitude=30.,longitude=104.,altitude=500.) if config['id']!=2 else None,events=[],reasons=[])
     def close(self):pass
     def actions(self,actions):

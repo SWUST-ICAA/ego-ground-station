@@ -20,6 +20,7 @@ class Mission:
         self.traj_base = 0
         self.seen_offboard = False
         self.fence=None;self.return_points=[];self.return_index=0;self.visited=[];self.requires_geo=False
+        self.local_frame=None;self.skipped=[];self.progress_position=None;self.progress_time=0.
 
     @property
     def active(self):
@@ -54,6 +55,13 @@ class Mission:
             raise ValueError('起飞点超出规划地图')
         fence=None;returns=[]
         if plan is not None:
+            frame=plan.get('local_frame')
+            if frame:
+                values=[float(frame[k]) for k in ('x','y','yaw')]
+                if not all(math.isfinite(v) for v in values):raise ValueError('起飞坐标参考无效')
+                yaw=state.get('yaw')
+                if yaw is None or abs(math.atan2(math.sin(yaw-values[2]),math.cos(yaw-values[2])))>.05:
+                    raise ValueError('机头方向已变化，请重新搜索航线')
             if plan.get('mode') not in {'test','competition'}:raise ValueError('围栏模式无效')
             fence=Fence(plan['polygon'],plan['margin'])
             if math.dist(pos[:2],xy(plan['origin']))>.3:raise ValueError('起点已变化，请重新搜索航线')
@@ -71,6 +79,8 @@ class Mission:
             if not fence.segment(previous,pos[:2],.3):raise ValueError('起飞点不在返航安全区')
             returns[-1]=[pos[0],pos[1],1.5]
         self.fence=fence;self.return_points=returns;self.return_index=0
+        self.local_frame=dict(plan['local_frame']) if plan and plan.get('local_frame') else None
+        self.skipped=[]
         self.requires_geo=bool(plan and (plan.get('mode')=='competition' or plan.get('geo_anchor')))
         self.visited=[[pos[0],pos[1],1.5]]
         self.points, self.home, self.index = validated, [pos[0], pos[1], 1.5], 0
@@ -81,7 +91,27 @@ class Mission:
     def send_goal(self, point, state, now, phase):
         self.transition(phase, now)
         self.traj_base = state.get('traj_seq', 0)
+        self.progress_position=list(state['position']);self.progress_time=now
         return [('goal', point)]
+
+    def skip_blocked(self,state,now,reason):
+        """Advance in route order; leave path feasibility to the onboard planner."""
+        phase=self.phase;idx=self.index if phase=='OUTBOUND' else self.return_index
+        self.skipped.append(dict(phase=phase,index=idx,reason=reason))
+        route=self.points if phase=='OUTBOUND' else (self.return_points or [self.home])
+        prefix=('去程' if phase=='OUTBOUND' else '返航')+f'第 {idx+1} 点：{reason}'
+        for j in range(idx+1,len(route)):
+            if phase=='OUTBOUND':self.index=j
+            else:self.return_index=j
+            actions=self.send_goal(route[j],state,now,phase)
+            self.reason=prefix+f'；跳至第 {j+1} 点'
+            return [('log',self.reason)]+actions
+        if phase=='OUTBOUND':
+            self.return_index=0
+            actions=self.send_goal(self.return_points[0] if self.return_points else self.home,state,now,'RETURNING')
+            self.reason=prefix+'；去程点已处理完，进入返航'
+            return [('log',self.reason)]+actions
+        return [('log',prefix+'；返航路径无法继续')]+self.land(state,now,'返航航点持续不可达，请求就地降落')
 
     def land(self, state, now, reason='操作员请求降落'):
         if not state.get('fresh'):
@@ -183,6 +213,8 @@ class Mission:
             return []
         if self.phase in {'OUTBOUND', 'RETURNING'}:
             target = (self.return_points[self.return_index] if self.return_points else self.home) if self.phase == 'RETURNING' else self.points[self.index]
+            if self.progress_position is None or math.dist(state['position'],self.progress_position)>.3:
+                self.progress_position=list(state['position']);self.progress_time=now
             if state.get('traj_seq', 0) > self.traj_base and self.stable(state, target, now):
                 if self.phase == 'RETURNING':
                     if self.return_points and self.return_index+1<len(self.return_points):
@@ -195,12 +227,15 @@ class Mission:
                     self.return_index=0
                     return self.send_goal(self.return_points[0] if self.return_points else self.home, state, now, 'RETURNING')
                 return self.send_goal(self.points[self.index], state, now, 'OUTBOUND')
-            if now-self.since > 120 or (now-self.since > 12 and state.get('traj_seq', 0) <= self.traj_base):
-                self.transition('LAND_REQUESTED', now, '规划输出或航点执行超时，请求就地降落')
-                return [('land', None)]
+            reason=''
+            if now-self.since>3 and state.get('command_age',0)>3:reason='有效跟踪指令中断超过 3 秒'
+            elif now-self.progress_time>10 and math.dist(state['position'],target)>.45:reason='连续 10 秒位置无进展'
+            elif now-self.since>120:reason='当前航点执行超过 120 秒'
+            elif now-self.since>12 and state.get('traj_seq',0)<=self.traj_base:reason='规划器未生成轨迹'
+            if reason:return self.skip_blocked(state,now,reason)
         return []
 
     def status(self):
-        return dict(phase=self.phase, reason=self.reason, points=self.points,
+        return dict(phase=self.phase, reason=self.reason, points=self.points,local_frame=self.local_frame,skipped=list(self.skipped),
                     index=self.index, home=self.home, active=self.active, return_points=self.return_points,
                     return_index=self.return_index, fence=dict(polygon=self.fence.polygon,margin=self.fence.margin) if self.fence else None)

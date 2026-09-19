@@ -43,7 +43,7 @@ class LocalPlot(W.QWidget):
         p=QtGui.QPainter(self);p.setRenderHint(QtGui.QPainter.Antialiasing)
         p.fillRect(self.rect(),QtGui.QColor('#111d2c'))
         p.setPen(QtGui.QPen(QtGui.QColor('#35d0db' if self.selected else '#2d425c'),2 if self.selected else 1));p.drawRect(self.rect().adjusted(0,0,-1,-1))
-        p.setPen(QtGui.QColor('#c5d5e7'));p.drawText(12,23,f'{self.aircraft} 号机 · 局部 map / m')
+        p.setPen(QtGui.QColor('#c5d5e7'));p.drawText(12,23,f'{self.aircraft} 号机 · X右 / Y前 · m')
         local=[(v['a'],v['b']) for v in self.points if v['kind']=='local']
         actual=self.state.get('mission',{}).get('points',[])
         targets=[(a[0],a[1]) for a in actual] or local

@@ -17,7 +17,7 @@ class SiteWidget(W.QGroupBox):
         self.boundary=W.QPlainTextEdit();self.boundary.setMaximumHeight(85);self.boundary.setPlaceholderText('边界顶点依次填写，每行 X,Y（米）；不重复首点')
         self.boundary.setPlainText('\n'.join(f'{x:g},{y:g}' for x,y in self.profile['polygon']));layout.addWidget(self.boundary)
         self.confirm=W.QCheckBox('已向主办方确认边界坐标为 WGS84');self.confirm.setChecked(self.profile.get('datum_confirmed',False));layout.addWidget(self.confirm)
-        hint=W.QLabel('测试边界：每行 X,Y，按周界顺序。内缩包含机体与定位/制动余量；默认 3m 需实测确认。搜索额外预留 0.5m，地图范围为 X/Y 各 ±498.7m。');hint.setWordWrap(True);layout.addWidget(hint)
+        hint=W.QLabel('测试边界：以搜索时飞机位置为原点、机头为前，X 向右、Y 向前；每行 X,Y，按周界顺序。内缩包含机体与定位/制动余量；默认 3m，搜索额外预留 0.5m。');hint.setWordWrap(True);layout.addWidget(hint)
         self.button=W.QPushButton('搜索并预览勾选飞机的往返航线');self.button.clicked.connect(self.search);layout.addWidget(self.button);layout.addStretch()
         self.mode.currentIndexChanged.connect(self.on_change);self.margin.valueChanged.connect(self.on_change);self.boundary.textChanged.connect(self.on_change);self.confirm.toggled.connect(self.on_change)
         self.update_mode()

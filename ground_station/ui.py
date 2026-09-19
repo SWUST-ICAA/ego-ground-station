@@ -12,6 +12,7 @@ from .view_widgets import AllCheckBox, MapPanel, SelectCheckBox, StatusTable
 from .waypoint_editor import WaypointEditor
 from .site_widget import SiteWidget
 from .site import build_plan
+from .frame import reference, from_map, display
 
 PHASES={'IDLE':'待命','ARMING':'解锁中','TAKEOFF':'起飞中','OUTBOUND':'前往航点','RETURNING':'规划返航',
         'LAND_REQUESTED':'请求降落','LANDING':'降落中','COMPLETE':'任务完成','ERROR':'异常','MANUAL':'外部接管',
@@ -55,7 +56,7 @@ class Window(W.QMainWindow):
     def __init__(self,config,path,demo=False):
         super().__init__();self.config=config;self.path=Path(path);self.demo=demo
         self.states={};self.traces={a['id']:[] for a in config['aircraft']};self.current=config['aircraft'][0]['id']
-        self.workers={};self.event_seen={};self.loading=False;self.received={};self.plans={};self.plan_keys={}
+        self.workers={};self.event_seen={};self.loading=False;self.received={};self.plans={};self.plan_keys={};self.frames={}
         self.setWindowTitle('Fast Drone · 独立单机地面站'+(' [模拟演示]' if demo else ''))
         screen=W.QApplication.primaryScreen().availableGeometry()
         self.resize(min(1680,int(screen.width()*.9)),min(1080,int(screen.height()*.9)))
@@ -104,7 +105,7 @@ class Window(W.QMainWindow):
         self.waypoint_editor=WaypointEditor();editor_tabs.insertTab(0,self.waypoint_editor,'目标点');editor_tabs.setCurrentIndex(0)
         self.waypoint_editor.pointsChanged.connect(self.save_points)
         self.waypoint_editor.logMessage.connect(self.write_log)
-        text=W.QLabel('米制：本机 map 绝对坐标，单位 m。经纬度：WGS84 十进制度。\n航点按顺序执行，最后自动返回起飞点并降落。高度固定 1.5m。');text.setWordWrap(True);text.setObjectName('muted');ll.addWidget(text)
+        text=W.QLabel('米制：搜索时位置为原点、机头为前，X 向右、Y 向前；飞行中方向固定。经纬度：WGS84。\n移动或转动飞机后请重新搜索航线。最后返回起飞点并降落，高度 1.5m。');text.setWordWrap(True);text.setObjectName('muted');ll.addWidget(text)
         self.details=W.QLabel('等待遥测');self.details.setWordWrap(True);ll.addWidget(self.details)
         editor=W.QScrollArea();editor.setWidgetResizable(True);editor.setFrameShape(W.QFrame.NoFrame);editor.setWidget(left);editor.setMinimumSize(350,150)
         splitter.addWidget(editor)
@@ -187,6 +188,7 @@ class Window(W.QMainWindow):
             try:
                 if time.monotonic()-self.received.get(n,0)>3 or not self.states.get(n,{}).get('online'):raise ValueError('请先连接并获取新鲜定位')
                 plan=build_plan(self.site_widget.value(),self.points(n),self.states[n])
+                self.frames[n]=plan['flight_plan']['local_frame']
                 self.plans[n]=plan;self.plan_keys[n]=self.plan_key(n)
                 self.write_log(f"{n} 号 · 往返航线已生成：去程 {len(plan['waypoints'])} 点、返航 {len(plan['flight_plan']['return_points'])} 点；请核对地图后执行。")
             except (ValueError,KeyError,TypeError) as e:self.write_log(f'{n} 号 · 航线搜索失败：{e}')
@@ -227,7 +229,18 @@ class Window(W.QMainWindow):
             state=dict(self.states.get(n,{}),**state,ready=False,fresh=False,geo_ready=False)
         if state.get('error') and state.get('error')!=self.states.get(n,{}).get('error'):
             self.write_log(f"{n} 号 · {state['error']}")
+        old_session=self.states.get(n,{}).get('session_id')
+        if state.get('session_id') and old_session and old_session!=state['session_id']:
+            self.frames.pop(n,None);self.plans.pop(n,None);self.plan_keys.pop(n,None);self.traces[n]=[]
+            self.write_log(f'{n} 号 · 机上程序已重启，请重新搜索航线')
         self.states[n]=state;self.received[n]=time.monotonic()
+        if state.get('program') is False:
+            self.frames.pop(n,None);self.plans.pop(n,None);self.plan_keys.pop(n,None);self.traces[n]=[]
+        elif state.get('mission',{}).get('active') and state['mission'].get('local_frame'):
+            self.frames[n]=state['mission']['local_frame']
+        elif n not in self.frames and state.get('fresh') and state.get('ready') and not state.get('armed'):
+            try:self.frames[n]=reference(state)
+            except ValueError:pass
         row=next(i for i,a in enumerate(self.config['aircraft']) if a['id']==n)
         p=state.get('position');mode=state.get('mode','—');phase=state.get('mission',{}).get('phase','—')
         values=['在线' if state.get('online') else 'SSH 离线','就绪' if state.get('ready') else '未就绪',
@@ -247,7 +260,9 @@ class Window(W.QMainWindow):
         events=state.get('events',[])
         last=self.event_seen.get(n)
         if events and events[-1]!=last:
-            self.write_log(f"{n} 号 · {events[-1]['text']}");self.event_seen[n]=events[-1]
+            start=next((i+1 for i in range(len(events)-1,-1,-1) if events[i]==last),0)
+            for event in events[start:]:self.write_log(f"{n} 号 · {event['text']}")
+            self.event_seen[n]=events[-1]
         self.refresh_detail()
     def geo_available(self,n):
         state=self.states.get(n,{})
@@ -258,6 +273,9 @@ class Window(W.QMainWindow):
         for row,a in enumerate(self.config['aircraft']):
             n=a['id']
             self.table.item(row,4).setText('GNSS有效' if self.geo_available(n) else 'GNSS无效')
+            pos=self.states.get(n,{}).get('position');ref=self.frames.get(n)
+            self.table.item(row,7).setText(' / '.join(f'{v:.2f}' for v in from_map(pos,ref)) if pos and ref else '—')
+            self.table.item(row,7).setToolTip('X 向右、Y 向前，相对起飞参考点；Z 为机载地图高度')
         s=self.states.get(self.current,{});fresh=time.monotonic()-self.received.get(self.current,0)<3
         geo=self.geo_available(self.current);self.waypoint_editor.set_status(s,fresh,geo)
         self.notice.setText('经纬度和米制坐标均可设置。' if geo else '持续检测 GNSS 与坐标参考，可用后自动开放经纬度点；当前可设置米制点。')
@@ -268,8 +286,9 @@ class Window(W.QMainWindow):
         if m.get('reason'):parts.append(m['reason'])
         self.details.setText('\n'.join(parts));self.details.setVisible(bool(parts))
         for n,plot in self.map_panel.plots.items():
-            plot.preview=self.plans.get(n,{}).get('preview')
-            plot.selected=n==self.current;plot.change(self.states.get(n,{}),self.points(n),self.traces[n])
+            state,points,trace,preview=display(self.states.get(n,{}),self.points(n),self.traces[n],self.plans.get(n,{}).get('preview'),self.frames.get(n))
+            plot.preview=preview
+            plot.selected=n==self.current;plot.change(state,points,trace)
     def closeEvent(self,event):
         active=[n for n,s in self.states.items() if s.get('mission',{}).get('active')]
         if active:self.write_log(f'关闭界面；飞机 {active} 的机上任务仍会继续执行。')

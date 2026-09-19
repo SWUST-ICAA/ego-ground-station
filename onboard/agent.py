@@ -16,7 +16,7 @@ from geo import to_local
 from mission import Mission
 
 SOCKET = '/tmp/fast-drone-ground-station.sock'
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 
 
 def request(payload):
@@ -45,6 +45,7 @@ class Agent:
         from quadrotor_msgs.msg import PositionCommand
         self.rospy = rospy
         self.aircraft = aircraft
+        self.session_id=str(time.time_ns())
         self.lock = threading.RLock()
         self.data_lock = threading.RLock()
         self.data = {}
@@ -58,6 +59,7 @@ class Agent:
         self.traj_seq = 0
         self.goal_stamp = float("inf")
         self.accepted_trajectory = None
+        self.last_forwarded=time.monotonic()
         self.fence_violation=None
         self.controller = None
         self.controller_log = None
@@ -119,6 +121,7 @@ class Agent:
                     if not fence.segment(p,q):raise ValueError('跟踪指令将进入边界缓冲区')
                 except (ValueError,TypeError) as e:self.fence_violation=str(e);return
             self.command_pub.publish(msg)
+            self.last_forwarded=time.monotonic()
 
     def snapshot(self):
         with self.data_lock:
@@ -193,11 +196,12 @@ class Agent:
         battery=None
         if batt and math.isfinite(batt.percentage) and 0<=batt.percentage<=1:
             battery=round(batt.percentage*100,1)
-        return dict(aircraft=self.aircraft,version=VERSION,connected=bool(state and state.connected),fresh=fresh,
+        return dict(aircraft=self.aircraft,version=VERSION,session_id=self.session_id,connected=bool(state and state.connected),fresh=fresh,
                     ready=ready,reasons=reasons,armed=bool(state and state.armed),landed=bool(ext and ext.landed_state==1),
                     mode=state.mode if state else 'UNKNOWN',position=pos,speed=speed,yaw=yaw,battery=battery,
                     voltage=batt.voltage if batt and math.isfinite(batt.voltage) else None,
-                    capabilities=['fence-v1'],geo_anchor=dict(self.anchor) if self.anchor else None,velocity=velocity,
+                    capabilities=['fence-v1','flight-v2'],geo_anchor=dict(self.anchor) if self.anchor else None,velocity=velocity,
+                    command_age=max(0.,now-self.last_forwarded),
                     gps=gps_info,geo_ready=bool(gps_valid and self.anchor and heading and pos),
                     bridge_ready=bridge_ready,cloud_points=points,controller='/px4_controller' in node_set,
                     traj_seq=self.traj_seq,mission=self.mission.status(),events=list(self.events),stopping=self.stopping)
@@ -218,7 +222,8 @@ class Agent:
         from mavros_msgs.srv import CommandBool, SetMode
         from geometry_msgs.msg import PoseStamped
         for action,value in actions:
-            if action=='controller_start':
+            if action=='log':self.log(value)
+            elif action=='controller_start':
                 self.controller_log=open('/tmp/ground-station-controller.log','a')
                 self.controller=subprocess.Popen(['rosrun','controller','px4_controller_node','__name:=px4_controller',
                      '_position_cmd_topic:=/ground_station/position_cmd'],stdout=self.controller_log,stderr=subprocess.STDOUT,start_new_session=True)
@@ -244,6 +249,7 @@ class Agent:
             elif action=='goal':
                 msg=PoseStamped();msg.header.stamp=self.rospy.Time.now();msg.header.frame_id='map'
                 self.goal_stamp=msg.header.stamp.to_sec();self.accepted_trajectory=None
+                self.last_forwarded=time.monotonic()
                 msg.pose.position.x,msg.pose.position.y,msg.pose.position.z=value;msg.pose.orientation.w=1
                 self.goal.publish(msg)
                 self.log('规划目标 x=%.2f y=%.2f z=%.2f'%tuple(value))
@@ -283,6 +289,7 @@ class Agent:
             if command in {'prepare','start'}:
                 plan=req.get('flight_plan')
                 if not isinstance(plan,dict):raise ValueError('需要地面站生成的围栏航线，请更新地面站')
+                if not isinstance(plan.get('local_frame'),dict):raise ValueError('航线缺少起飞坐标参考，请重启新版地面站并重新搜索')
                 reference=plan.get('geo_anchor')
                 if plan.get('mode')=='competition' and not reference:raise ValueError('比赛任务缺少地理参考')
                 if reference:

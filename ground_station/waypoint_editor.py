@@ -12,7 +12,7 @@ class WaypointEditor(W.QWidget):
         self.setStyleSheet('QPushButton{padding:6px 10px} QLineEdit{padding:5px;border:1px solid #30465f;border-radius:4px}')
         self.aircraft=None;self.points=[];self.drafts={};self.state={};self.geo_ready=False;self.fresh=False
         layout=W.QVBoxLayout(self);layout.setContentsMargins(0,0,0,0);layout.setSpacing(8)
-        self.kind=W.QComboBox();self.kind.addItem('米制坐标 · 本机 map','local');self.kind.addItem('经纬度 · WGS84','geo')
+        self.kind=W.QComboBox();self.kind.addItem('米制坐标 · X 右 / Y 前','local');self.kind.addItem('经纬度 · WGS84','geo')
         layout.addWidget(self.kind)
         form=W.QFormLayout();self.a_label=W.QLabel();self.b_label=W.QLabel()
         self.a=W.QLineEdit();self.b=W.QLineEdit()
@@ -40,7 +40,7 @@ class WaypointEditor(W.QWidget):
 
     def change_kind(self,*args):
         geo=self.kind.currentData()=='geo'
-        self.a_label.setText('纬度 (°)' if geo else 'X (m)');self.b_label.setText('经度 (°)' if geo else 'Y (m)')
+        self.a_label.setText('纬度 (°)' if geo else 'X 向右 (m)');self.b_label.setText('经度 (°)' if geo else 'Y 向前 (m)')
         self.a.setPlaceholderText('-90 ～ 90' if geo else '-498.7 < X < 498.7')
         self.b.setPlaceholderText('-180 ～ 180' if geo else '-498.7 < Y < 498.7')
         self.a.clear();self.b.clear();self.update_actions()
@@ -80,6 +80,7 @@ class WaypointEditor(W.QWidget):
         except ValueError as e:
             self.message.setText('坐标无效：'+(str(e) if 'could not convert' not in str(e) else '请完整填写两个数字。'));self.logMessage.emit(f'{self.aircraft} 号 · '+self.message.text());return
         point=dict(kind=kind,a=a,b=b)
+        if kind=='local':point['frame']='right-forward'
         if replace:self.points[row]=point
         else:self.points.append(point);row=len(self.points)-1
         self.publish(row,'已保存到本机航点列表；执行顺序为从上到下。')
@@ -88,7 +89,7 @@ class WaypointEditor(W.QWidget):
         blocker=QtCore.QSignalBlocker(self.table);self.table.setRowCount(len(self.points))
         for i,p in enumerate(self.points):
             geo=p['kind']=='geo';digits=7 if geo else 3
-            for col,text in enumerate(('经纬度' if geo else '米制',f"{p['a']:.{digits}f}",f"{p['b']:.{digits}f}")):
+            for col,text in enumerate(('经纬度' if geo else '米制' if p.get('frame')=='right-forward' else '旧map·需重存',f"{p['a']:.{digits}f}",f"{p['b']:.{digits}f}")):
                 item=W.QTableWidgetItem(text);item.setToolTip(str(p['a' if col==1 else 'b']) if col else text);self.table.setItem(i,col,item)
         self.table.clearSelection();self.table.setCurrentCell(-1,-1)
         if 0<=row<len(self.points):self.table.selectRow(row)

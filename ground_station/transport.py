@@ -84,7 +84,7 @@ class Remote:
             if not any(t in str(e) for t in ['No such file','Connection refused']):raise
         else:
             if current.get('stopping'):raise RuntimeError('上次停止已锁定代理，请执行关闭程序后重新启动')
-            if 'fence-v1' not in current.get('capabilities',[]):raise RuntimeError('机载代理需更新围栏功能；着陆且未解锁时先关闭程序，再重新启动')
+            if 'flight-v2' not in current.get('capabilities',[]):raise RuntimeError('机载代理需更新坐标与跳点功能；着陆且未解锁时先关闭程序，再重新启动')
             return current
         destination='/home/'+self.config['user']+'/.fast-drone-ground-station'
         self.shell('mkdir -p '+shlex.quote(destination))
