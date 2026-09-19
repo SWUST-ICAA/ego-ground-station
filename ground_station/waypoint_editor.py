@@ -13,12 +13,11 @@ class WaypointEditor(W.QWidget):
         self.aircraft=None;self.points=[];self.drafts={};self.state={};self.geo_ready=False;self.fresh=False
         layout=W.QVBoxLayout(self);layout.setContentsMargins(0,0,0,0);layout.setSpacing(8)
         self.kind=W.QComboBox();self.kind.addItem('米制坐标 · 本机 map','local');self.kind.addItem('经纬度 · WGS84','geo')
-        mode_row=W.QHBoxLayout();mode_row.addWidget(self.kind,1);layout.addLayout(mode_row)
+        layout.addWidget(self.kind)
         form=W.QFormLayout();self.a_label=W.QLabel();self.b_label=W.QLabel()
         self.a=W.QLineEdit();self.b=W.QLineEdit()
         for field in (self.a,self.b):field.setMinimumWidth(150);field.setClearButtonEnabled(True)
         form.addRow(self.a_label,self.a);form.addRow(self.b_label,self.b);layout.addLayout(form)
-        self.read=W.QPushButton('读取当前位置');self.read.clicked.connect(self.read_position);mode_row.addWidget(self.read)
         actions=W.QHBoxLayout();self.add=W.QPushButton('添加航点');self.add.setObjectName('primary')
         self.apply=W.QPushButton('保存修改');actions.addWidget(self.add);actions.addWidget(self.apply);layout.addLayout(actions)
         self.add.clicked.connect(lambda:self.commit(False));self.apply.clicked.connect(lambda:self.commit(True))
@@ -63,18 +62,9 @@ class WaypointEditor(W.QWidget):
         geo=self.kind.currentData()=='geo';enabled=not geo or self.geo_ready
         row=self.table.currentRow();selected=0<=row<len(self.points)
         self.add.setEnabled(enabled);self.apply.setEnabled(enabled and selected)
-        self.read.setEnabled(self.geo_ready if geo else self.fresh and bool(self.state.get('fresh')) and bool(self.state.get('position')))
         self.up.setEnabled(selected and row>0);self.down.setEnabled(selected and row<len(self.points)-1);self.delete.setEnabled(selected)
         hint='' if enabled else 'GNSS 与坐标参考暂不可用，恢复后自动启用。'
         self.add.setToolTip(hint);self.apply.setToolTip(hint)
-
-    def read_position(self):
-        self.update_actions()
-        if not self.read.isEnabled():return
-        if self.kind.currentData()=='geo':
-            gps=self.state['gps'];a,b=gps['latitude'],gps['longitude'];digits=7
-        else:a,b=self.state['position'][:2];digits=3
-        self.a.setText(f'{a:.{digits}f}');self.b.setText(f'{b:.{digits}f}');self.mark_draft()
 
     def commit(self,replace):
         kind=self.kind.currentData();row=self.table.currentRow()
