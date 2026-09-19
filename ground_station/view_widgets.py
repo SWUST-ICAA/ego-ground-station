@@ -33,7 +33,7 @@ class LocalPlot(W.QWidget):
     def __init__(self,aircraft):
         super().__init__();self.setMinimumSize(180,150)
         self.setSizePolicy(W.QSizePolicy.Expanding,W.QSizePolicy.Expanding)
-        self.aircraft=aircraft;self.selected=False;self.setCursor(QtCore.Qt.PointingHandCursor);self.state={};self.points=[];self.trace=[]
+        self.aircraft=aircraft;self.selected=False;self.preview=None;self.setCursor(QtCore.Qt.PointingHandCursor);self.state={};self.points=[];self.trace=[]
     def mousePressEvent(self,event):
         if event.button()==QtCore.Qt.LeftButton:self.clicked.emit(self.aircraft)
         super().mousePressEvent(event)
@@ -48,11 +48,25 @@ class LocalPlot(W.QWidget):
         actual=self.state.get('mission',{}).get('points',[])
         targets=[(a[0],a[1]) for a in actual] or local
         pos=self.state.get('position');home=self.state.get('mission',{}).get('home')
-        coords=self.trace+targets+([(pos[0],pos[1])] if pos else [])+([(home[0],home[1])] if home else [])+[(0,0)]
+        preview=self.preview or {}
+        fence=self.state.get('mission',{}).get('fence') or preview
+        polygon=fence.get('polygon',[])
+        planned=preview.get('outbound',[])
+        coords=[tuple(p) for p in polygon+planned]+self.trace+targets+([(pos[0],pos[1])] if pos else [])+([(home[0],home[1])] if home else [])+[(0,0)]
         extent=max(5,max(abs(v) for xy in coords for v in xy)+2)
         scale=min(self.width()-52,self.height()-65)/(2*extent)
         cx,cy=self.width()/2,(self.height()+8)/2
         def xy(a,b):return QtCore.QPointF(cx+a*scale,cy-b*scale)
+        if polygon:
+            shape=QtGui.QPainterPath();shape.addPolygon(QtGui.QPolygonF([xy(*pt) for pt in polygon]));shape.closeSubpath()
+            p.save();p.setClipPath(shape)
+            p.setPen(QtGui.QPen(QtGui.QColor(240,140,65,90),max(1,2*fence['margin']*scale),QtCore.Qt.SolidLine,QtCore.Qt.RoundCap,QtCore.Qt.RoundJoin));p.setBrush(QtCore.Qt.NoBrush);p.drawPath(shape);p.restore()
+            p.setPen(QtGui.QPen(QtGui.QColor('#ed9365'),1));p.setBrush(QtCore.Qt.NoBrush);p.drawPath(shape)
+        if len(planned)>1:
+            p.setPen(QtGui.QPen(QtGui.QColor('#a2e789'),2,QtCore.Qt.DashLine));p.drawPolyline(QtGui.QPolygonF([xy(*pt) for pt in planned]))
+        returns=preview.get('return_path',[])
+        if len(returns)>1:
+            p.setPen(QtGui.QPen(QtGui.QColor('#dcb2ff'),1,QtCore.Qt.DotLine));p.drawPolyline(QtGui.QPolygonF([xy(*pt) for pt in returns]))
         step=max(1,math.ceil(extent/4))
         p.setPen(QtGui.QPen(QtGui.QColor('#233247'),1))
         for i in range(-4,5):

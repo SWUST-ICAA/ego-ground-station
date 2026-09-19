@@ -1,5 +1,9 @@
 """Deterministic per-aircraft mission; actions executed by the ROS adapter."""
 import math
+try:
+    from .fence import Fence, xy
+except ImportError:
+    from fence import Fence, xy
 
 TERMINAL = {'IDLE', 'COMPLETE', 'ERROR', 'MANUAL'}
 
@@ -15,6 +19,7 @@ class Mission:
         self.dwell = None
         self.traj_base = 0
         self.seen_offboard = False
+        self.fence=None;self.return_points=[];self.return_index=0;self.visited=[];self.requires_geo=False
 
     @property
     def active(self):
@@ -23,7 +28,7 @@ class Mission:
     def transition(self, phase, now, reason=''):
         self.phase, self.since, self.reason, self.dwell = phase, now, reason, None
 
-    def start(self, points, state, now):
+    def start(self, points, state, now, plan=None):
         if self.active:
             raise ValueError('任务正在执行，请先返航或降落')
         if not state.get('ready') or not state.get('fresh') or not state.get('connected'):
@@ -47,6 +52,27 @@ class Mission:
             validated.append([x, y, 1.5])
         if abs(pos[0]) >= 48.7 or abs(pos[1]) >= 23.7:
             raise ValueError('起飞点超出规划地图')
+        fence=None;returns=[]
+        if plan is not None:
+            if plan.get('mode') not in {'test','competition'}:raise ValueError('围栏模式无效')
+            fence=Fence(plan['polygon'],plan['margin'])
+            if math.dist(pos[:2],xy(plan['origin']))>.3:raise ValueError('起点已变化，请重新搜索航线')
+            last=pos[:2]
+            for point in validated:
+                if not fence.segment(last,point[:2],.3):raise ValueError('去程航线超出围栏或余量不足')
+                last=point[:2]
+            raw=plan['return_points']
+            if not 1<=len(raw)<=50:raise ValueError('返航途经点数量无效')
+            for point in raw:
+                if not fence.segment(last,point,.3):raise ValueError('返航航线超出围栏或余量不足')
+                returns.append([float(point[0]),float(point[1]),1.5]);last=point
+            if math.dist(last,pos[:2])>.3:raise ValueError('返航终点与起飞点不一致')
+            previous=returns[-2][:2] if len(returns)>1 else validated[-1][:2]
+            if not fence.segment(previous,pos[:2],.3):raise ValueError('起飞点不在返航安全区')
+            returns[-1]=[pos[0],pos[1],1.5]
+        self.fence=fence;self.return_points=returns;self.return_index=0
+        self.requires_geo=bool(plan and (plan.get('mode')=='competition' or plan.get('geo_anchor')))
+        self.visited=[[pos[0],pos[1],1.5]]
         self.points, self.home, self.index = validated, [pos[0], pos[1], 1.5], 0
         self.seen_offboard = False
         self.transition('ARMING', now)
@@ -70,7 +96,28 @@ class Mission:
             raise ValueError('无有效起飞点或本机定位不可用')
         if self.phase not in {'OUTBOUND', 'RETURNING'} or state.get('mode') != 'OFFBOARD':
             raise ValueError('仅在本次自主巡航中可以规划返航；其他状态请降落或手动接管')
+        if self.phase=='RETURNING':return []
+        if self.fence:
+            fault=self.fence_fault(state)
+            if fault:return self.land(state,now,fault)
+            if math.dist(state['position'],self.home)<=.3 and state.get('speed',100)<=.2:return self.land(state,now,'已在起飞点上方，请求降落')
+            # Follow reached outbound corners backwards; never shortcut a concave boundary.
+            candidates=list(reversed(self.visited))
+            first=next((i for i,p in enumerate(candidates) if self.fence.segment(state['position'][:2],p[:2])),None)
+            if first is None:return self.land(state,now,'当前位置不能安全接入返航途经点，请求就地降落')
+            self.return_points=candidates[first:];self.return_index=0
+            return self.send_goal(self.return_points[0],state,now,'RETURNING')
         return self.send_goal(self.home, state, now, 'RETURNING')
+
+    def fence_fault(self,state):
+        if not self.fence:return ''
+        pos=state.get('position')
+        if not pos or not self.fence.contains(pos[:2]):return '实际位置已进入边界缓冲区'
+        if self.requires_geo and not state.get('geo_ready'):return '比赛/经纬度任务的地理参考失效'
+        velocity=state.get('velocity') or [0.,0.,0.]
+        predicted=[pos[i]+velocity[i] for i in (0,1)]
+        if not self.fence.segment(pos[:2],predicted):return '按当前速度预计 1 秒内进入边界缓冲区'
+        return ''
 
     def stable(self, state, point, now):
         near = math.dist(state['position'], point) <= .3 and state.get('speed', 100) <= .2
@@ -113,12 +160,15 @@ class Mission:
         if fresh and not state.get('armed'):
             self.transition('ERROR', now, '任务中飞控已锁定，任务取消')
             return [('controller_stop', None)]
-        if fresh and self.phase in {'OUTBOUND', 'RETURNING'} and state.get('mode') != 'OFFBOARD':
+        if fresh and (self.phase in {'OUTBOUND', 'RETURNING'} or (self.phase=='TAKEOFF' and self.seen_offboard)) and state.get('mode') != 'OFFBOARD':
             self.transition('MANUAL', now, '飞行模式已改变，停止任务，不自动抢回控制')
             return [('controller_stop', None)]
         if not fresh or not state.get('ready'):
             self.transition('LAND_REQUESTED', now, '本机定位/传感器/飞控数据失效，请求就地降落')
             return [('land', None)]
+        fault=self.fence_fault(state)
+        if fault:
+            self.transition('LAND_REQUESTED',now,fault);return [('land',None)]
         if self.phase == 'TAKEOFF':
             if self.seen_offboard and state.get('mode') != 'OFFBOARD':
                 self.transition('MANUAL', now, '起飞过程中已切换模式，停止自动任务')
@@ -132,14 +182,18 @@ class Mission:
                 return [('land', None)]
             return []
         if self.phase in {'OUTBOUND', 'RETURNING'}:
-            target = self.home if self.phase == 'RETURNING' else self.points[self.index]
+            target = (self.return_points[self.return_index] if self.return_points else self.home) if self.phase == 'RETURNING' else self.points[self.index]
             if state.get('traj_seq', 0) > self.traj_base and self.stable(state, target, now):
                 if self.phase == 'RETURNING':
+                    if self.return_points and self.return_index+1<len(self.return_points):
+                        self.return_index+=1;return self.send_goal(self.return_points[self.return_index],state,now,'RETURNING')
                     self.transition('LAND_REQUESTED', now, '已返回起飞点，自动降落')
                     return [('land', None)]
+                self.visited.append(list(self.points[self.index]))
                 self.index += 1
                 if self.index == len(self.points):
-                    return self.send_goal(self.home, state, now, 'RETURNING')
+                    self.return_index=0
+                    return self.send_goal(self.return_points[0] if self.return_points else self.home, state, now, 'RETURNING')
                 return self.send_goal(self.points[self.index], state, now, 'OUTBOUND')
             if now-self.since > 120 or (now-self.since > 12 and state.get('traj_seq', 0) <= self.traj_base):
                 self.transition('LAND_REQUESTED', now, '规划输出或航点执行超时，请求就地降落')
@@ -148,4 +202,5 @@ class Mission:
 
     def status(self):
         return dict(phase=self.phase, reason=self.reason, points=self.points,
-                    index=self.index, home=self.home, active=self.active)
+                    index=self.index, home=self.home, active=self.active, return_points=self.return_points,
+                    return_index=self.return_index, fence=dict(polygon=self.fence.polygon,margin=self.fence.margin) if self.fence else None)

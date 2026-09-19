@@ -10,6 +10,8 @@ from .transport import Remote
 from .demo import Demo
 from .view_widgets import AllCheckBox, MapPanel, SelectCheckBox, StatusTable
 from .waypoint_editor import WaypointEditor
+from .site_widget import SiteWidget
+from .site import build_plan
 
 PHASES={'IDLE':'待命','ARMING':'解锁中','TAKEOFF':'起飞中','OUTBOUND':'前往航点','RETURNING':'规划返航',
         'LAND_REQUESTED':'请求降落','LANDING':'降落中','COMPLETE':'任务完成','ERROR':'异常','MANUAL':'外部接管',
@@ -53,7 +55,7 @@ class Window(W.QMainWindow):
     def __init__(self,config,path,demo=False):
         super().__init__();self.config=config;self.path=Path(path);self.demo=demo
         self.states={};self.traces={a['id']:[] for a in config['aircraft']};self.current=config['aircraft'][0]['id']
-        self.workers={};self.event_seen={};self.loading=False;self.received={}
+        self.workers={};self.event_seen={};self.loading=False;self.received={};self.plans={};self.plan_keys={}
         self.setWindowTitle('Fast Drone · 独立单机地面站'+(' [模拟演示]' if demo else ''))
         screen=W.QApplication.primaryScreen().availableGeometry()
         self.resize(min(1680,int(screen.width()*.9)),min(1080,int(screen.height()*.9)))
@@ -95,8 +97,11 @@ class Window(W.QMainWindow):
         header=W.QHBoxLayout();header.addWidget(W.QLabel('航点设置'));self.selector=W.QComboBox()
         for a in config['aircraft']:self.selector.addItem(f"{a['id']} 号机",a['id'])
         self.selector.currentIndexChanged.connect(self.switch);header.addWidget(self.selector);header.addStretch();ll.addLayout(header)
+        editor_tabs=W.QTabWidget();ll.addWidget(editor_tabs,1)
+        self.site_widget=SiteWidget(config.get('site'));editor_tabs.addTab(self.site_widget,'场地 / 航线')
+        self.site_widget.changed.connect(self.site_changed);self.site_widget.search.connect(self.search_routes)
         self.notice=W.QLabel();self.notice.setWordWrap(True);ll.addWidget(self.notice)
-        self.waypoint_editor=WaypointEditor();ll.addWidget(self.waypoint_editor,1)
+        self.waypoint_editor=WaypointEditor();editor_tabs.insertTab(0,self.waypoint_editor,'目标点');editor_tabs.setCurrentIndex(0)
         self.waypoint_editor.pointsChanged.connect(self.save_points)
         self.waypoint_editor.logMessage.connect(self.write_log)
         text=W.QLabel('米制：本机 map 绝对坐标，单位 m。经纬度：WGS84 十进制度。\n航点按顺序执行，最后自动返回起飞点并降落。高度固定 1.5m。');text.setWordWrap(True);text.setObjectName('muted');ll.addWidget(text)
@@ -159,6 +164,7 @@ class Window(W.QMainWindow):
         with os.fdopen(fd,'w') as f:json.dump(self.config,f,ensure_ascii=False,indent=2)
         os.replace(temporary,self.path);os.chmod(self.path,0o600)
     def save_points(self,points):
+        self.plans.pop(self.current,None);self.plan_keys.pop(self.current,None)
         self.config.setdefault('waypoints',{})[str(self.current)]=points;self.persist();self.refresh_detail()
     def load_points(self):
         self.waypoint_editor.set_aircraft(self.current,self.points(self.current));self.refresh_detail()
@@ -166,6 +172,25 @@ class Window(W.QMainWindow):
         self.current=self.selector.currentData();self.load_points()
     def select_aircraft(self,n):
         self.selector.setCurrentIndex(self.selector.findData(n))
+    def site_changed(self):
+        self.plans.clear();self.plan_keys.clear()
+        try:self.config['site']=self.site_widget.value();self.persist()
+        except ValueError as e:self.write_log(str(e))
+        self.refresh_detail()
+    def plan_key(self,n):
+        return json.dumps([self.site_widget.value(),self.points(n)],sort_keys=True,allow_nan=False)
+    def search_routes(self):
+        ids=self.selected()
+        if not ids:self.write_log('请先勾选要搜索航线的飞机。');return
+        for n in ids:
+            self.plans.pop(n,None);self.plan_keys.pop(n,None)
+            try:
+                if time.monotonic()-self.received.get(n,0)>3 or not self.states.get(n,{}).get('online'):raise ValueError('请先连接并获取新鲜定位')
+                plan=build_plan(self.site_widget.value(),self.points(n),self.states[n])
+                self.plans[n]=plan;self.plan_keys[n]=self.plan_key(n)
+                self.write_log(f"{n} 号 · 往返航线已生成：去程 {len(plan['waypoints'])} 点、返航 {len(plan['flight_plan']['return_points'])} 点；请核对地图后执行。")
+            except (ValueError,KeyError,TypeError) as e:self.write_log(f'{n} 号 · 航线搜索失败：{e}')
+        self.refresh_detail()
     def batch(self,command):
         ids=self.selected()
         if not ids:self.write_log('未选择飞机，未提交操作。');return
@@ -178,6 +203,9 @@ class Window(W.QMainWindow):
             errors=[]
             for n in ids:
                 s=self.states.get(n,{})
+                try:
+                    if n not in self.plans or self.plan_keys.get(n)!=self.plan_key(n):errors.append(f'{n} 号：请先搜索并预览当前往返航线')
+                except ValueError as e:errors.append(str(e))
                 if time.monotonic()-self.received.get(n,0)>3 or not s.get('online',False) or not s.get('ready'):errors.append(f'{n} 号：状态未就绪')
                 if not self.points(n):errors.append(f'{n} 号：未设置航点')
                 if any(p['kind']=='geo' for p in self.points(n)) and not s.get('geo_ready'):errors.append(f'{n} 号：经纬度不可用，改用米制点')
@@ -186,7 +214,7 @@ class Window(W.QMainWindow):
             detail={'start':'请求解锁并起飞，按各机航点飞行，然后规划返航并自动降落。','return':'取消后续航点，通过规划器返回各自起飞点并降落。','land':'在当前位置请求 AUTO.LAND，取消当前任务。','stop_program':'仅关闭已着陆且未解锁的飞机程序。'}[command]
             self.write_log(f"飞机 {ids}：{detail}")
         for n in ids:
-            params=dict(waypoints=list(self.points(n))) if command=='start' else {}
+            params={k:self.plans[n][k] for k in ('waypoints','flight_plan')} if command=='start' else {}
             self.workers[n].submit(command,params)
             self.write_log(f'{n} 号 · 已提交 {command}；各机独立接受/拒绝，非同步起飞保证')
     def on_result(self,n,command,ok,text):
@@ -226,6 +254,7 @@ class Window(W.QMainWindow):
         return bool(time.monotonic()-self.received.get(n,0)<3 and state.get('online')
                     and state.get('geo_ready') and state.get('gps'))
     def refresh_detail(self):
+        self.site_widget.setEnabled(not any(s.get('armed') or s.get('mission',{}).get('active') for s in self.states.values()))
         for row,a in enumerate(self.config['aircraft']):
             n=a['id']
             self.table.item(row,4).setText('GNSS有效' if self.geo_available(n) else 'GNSS无效')
@@ -239,6 +268,7 @@ class Window(W.QMainWindow):
         if m.get('reason'):parts.append(m['reason'])
         self.details.setText('\n'.join(parts));self.details.setVisible(bool(parts))
         for n,plot in self.map_panel.plots.items():
+            plot.preview=self.plans.get(n,{}).get('preview')
             plot.selected=n==self.current;plot.change(self.states.get(n,{}),self.points(n),self.traces[n])
     def closeEvent(self,event):
         active=[n for n,s in self.states.items() if s.get('mission',{}).get('active')]

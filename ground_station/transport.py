@@ -84,16 +84,17 @@ class Remote:
             if not any(t in str(e) for t in ['No such file','Connection refused']):raise
         else:
             if current.get('stopping'):raise RuntimeError('上次停止已锁定代理，请执行关闭程序后重新启动')
+            if 'fence-v1' not in current.get('capabilities',[]):raise RuntimeError('机载代理需更新围栏功能；着陆且未解锁时先关闭程序，再重新启动')
             return current
         destination='/home/'+self.config['user']+'/.fast-drone-ground-station'
         self.shell('mkdir -p '+shlex.quote(destination))
         sftp=self.client.open_sftp()
         try:
-            for name in ('agent.py','mission.py','geo.py'):
+            for name in ('agent.py','mission.py','geo.py','fence.py'):
                 sftp.put(str(ROOT/'onboard'/name),destination+'/'+name)
         finally:sftp.close()
         self.shell('docker exec '+CONTAINER+' mkdir -p /tmp/ground_station')
-        for name in ('agent.py','mission.py','geo.py'):
+        for name in ('agent.py','mission.py','geo.py','fence.py'):
             self.shell('docker cp '+shlex.quote(destination+'/'+name)+' '+CONTAINER+':/tmp/ground_station/'+name)
         self.shell('docker exec -d '+CONTAINER+' '+ENTRY+' python3 '+AGENT+' serve --aircraft '+str(int(self.config['id'])))
         for attempt in range(15):

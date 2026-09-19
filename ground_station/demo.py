@@ -11,6 +11,7 @@ class Demo:
         self.s=dict(aircraft=config['id'],program=False,connected=False,ready=False,fresh=True,armed=False,
                     landed=True,position=[0.,0.,0.],speed=0.,mode='AUTO.LOITER',controller=False,traj_seq=0,
                     battery=92.,voltage=24.1,bridge_ready=True,cloud_points=180,geo_ready=config['id']!=2,
+                    capabilities=['fence-v1'],geo_anchor=dict(lat=30.,lon=104.,alt=500.,x=0.,y=0.,rotation=0.) if config['id']!=2 else None,
                     gps=dict(latitude=30.,longitude=104.,altitude=500.) if config['id']!=2 else None,events=[],reasons=[])
     def close(self):pass
     def actions(self,actions):
@@ -42,7 +43,7 @@ class Demo:
                     if not self.s['geo_ready']:raise ValueError('无经纬度，米制可用')
                     points.append(to_local(p['a'],p['b'],dict(lat=30,lon=104,alt=500,x=0,y=0,rotation=0)))
                 else:points.append([p['a'],p['b']])
-            self.actions(self.mission.start(points,self.s,now))
+            self.actions(self.mission.start(points,self.s,now,params.get('flight_plan')))
         elif command=='return':self.actions(self.mission.return_home(self.s,now))
         elif command=='land':self.actions(self.mission.land(self.s,now))
         return self.status()

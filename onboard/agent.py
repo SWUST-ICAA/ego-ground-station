@@ -16,7 +16,7 @@ from geo import to_local
 from mission import Mission
 
 SOCKET = '/tmp/fast-drone-ground-station.sock'
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 
 
 def request(payload):
@@ -58,6 +58,7 @@ class Agent:
         self.traj_seq = 0
         self.goal_stamp = float("inf")
         self.accepted_trajectory = None
+        self.fence_violation=None
         self.controller = None
         self.controller_log = None
         self.stopping = False
@@ -94,6 +95,16 @@ class Agent:
             self.traj_seq += 1
             self.store('traj',msg)
             if msg.start_time.to_sec() >= self.goal_stamp:
+                if self.mission.fence:
+                    try:
+                        if msg.order!=3 or len(msg.pos_pts)<4:raise ValueError('不支持的规划轨迹结构')
+                        if len(msg.knots)!=len(msg.pos_pts)+4 or not all(math.isfinite(k) for k in msg.knots) or any(a>b for a,b in zip(msg.knots,msg.knots[1:])):raise ValueError('规划轨迹节点向量无效')
+                        # A cubic B-spline lies within each four-point control hull.
+                        for i in range(len(msg.pos_pts)-3):
+                            if not self.mission.fence.control_hull([(p.x,p.y) for p in msg.pos_pts[i:i+4]]):
+                                raise ValueError('规划轨迹控制包络越过内缩边界')
+                    except (ValueError,TypeError) as e:
+                        self.accepted_trajectory=None;self.fence_violation=str(e);return
                 self.accepted_trajectory = msg.traj_id
 
     def cmd_cb(self, msg):
@@ -101,6 +112,12 @@ class Agent:
         if (self.mission.phase in {"OUTBOUND", "RETURNING"}
                 and self.accepted_trajectory == msg.trajectory_id
                 and -.1 <= (self.rospy.Time.now()-msg.header.stamp).to_sec() <= .3):
+            fence=self.mission.fence
+            if fence:
+                try:
+                    p=[msg.position.x,msg.position.y];q=[p[0]+msg.velocity.x,p[1]+msg.velocity.y]
+                    if not fence.segment(p,q):raise ValueError('跟踪指令将进入边界缓冲区')
+                except (ValueError,TypeError) as e:self.fence_violation=str(e);return
             self.command_pub.publish(msg)
 
     def snapshot(self):
@@ -114,13 +131,14 @@ class Agent:
             return pair[0] if pair and now-pair[1] <= age else None
         state, ext, odom = get('state',2), get('extended',3), get('odom',.8)
         pos, speed, yaw = None, None, None
+        velocity=None
         if odom:
             p,q,v = odom.pose.pose.position,odom.pose.pose.orientation,odom.twist.twist.linear
             values = [p.x,p.y,p.z,v.x,v.y,v.z,q.x,q.y,q.z,q.w]
             norm = q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w
             age = (self.rospy.Time.now()-odom.header.stamp).to_sec()
             if all(math.isfinite(a) for a in values) and norm>.5 and -.1<=age<=.8:
-                pos=[p.x,p.y,p.z];speed=math.sqrt(v.x*v.x+v.y*v.y+v.z*v.z)
+                pos=[p.x,p.y,p.z];velocity=[v.x,v.y,v.z];speed=math.sqrt(v.x*v.x+v.y*v.y+v.z*v.z)
                 yaw=math.atan2(2*(q.w*q.z+q.x*q.y),norm-2*(q.y*q.y+q.z*q.z))
         bridge = get('bridge',2)
         try:
@@ -179,6 +197,7 @@ class Agent:
                     ready=ready,reasons=reasons,armed=bool(state and state.armed),landed=bool(ext and ext.landed_state==1),
                     mode=state.mode if state else 'UNKNOWN',position=pos,speed=speed,yaw=yaw,battery=battery,
                     voltage=batt.voltage if batt and math.isfinite(batt.voltage) else None,
+                    capabilities=['fence-v1'],geo_anchor=dict(self.anchor) if self.anchor else None,velocity=velocity,
                     gps=gps_info,geo_ready=bool(gps_valid and self.anchor and heading and pos),
                     bridge_ready=bridge_ready,cloud_points=points,controller='/px4_controller' in node_set,
                     traj_seq=self.traj_seq,mission=self.mission.status(),events=list(self.events),stopping=self.stopping)
@@ -208,6 +227,8 @@ class Agent:
             elif action=='arm':
                 s=self.snapshot()
                 if not s['ready'] or s['armed'] or not s['landed']:raise ValueError('解锁前复检失败')
+                fault=self.mission.fence_fault(s)
+                if fault:raise ValueError(fault)
                 with self.data_lock:
                     sp=self.data.get('setpoint')
                 if not sp or time.monotonic()-sp[1]>.3:
@@ -260,6 +281,15 @@ class Agent:
             s=self.snapshot();now=time.monotonic()
             # Validation failures have no effects. Action failures are recorded; never retry implicitly.
             if command in {'prepare','start'}:
+                plan=req.get('flight_plan')
+                if not isinstance(plan,dict):raise ValueError('需要地面站生成的围栏航线，请更新地面站')
+                reference=plan.get('geo_anchor')
+                if plan.get('mode')=='competition' and not reference:raise ValueError('比赛任务缺少地理参考')
+                if reference:
+                    if not s['geo_ready']:raise ValueError('地理参考失效，请重新搜索')
+                    mapped=to_local(reference['lat'],reference['lon'],self.anchor)
+                    angle=math.atan2(math.sin(reference['rotation']-self.anchor['rotation']),math.cos(reference['rotation']-self.anchor['rotation']))
+                    if math.dist(mapped,[reference['x'],reference['y']])>.25 or abs(angle)>.005:raise ValueError('地理参考已变化，请重新搜索航线')
                 points=[]
                 for p in req.get('waypoints',[]):
                     if p.get('kind')=='geo':
@@ -268,11 +298,12 @@ class Agent:
                     elif p.get('kind')=='local':points.append([p['a'],p['b']])
                     else:raise ValueError('未知航点类型')
                 if command=='prepare':
-                    Mission().start(points,s,now)
+                    Mission().start(points,s,now,plan)
                     response=dict(ok=True,status=self.snapshot(),resolved_points=points)
                     self.history[token]=response
                     return response
-                actions=self.mission.start(points,s,now)
+                actions=self.mission.start(points,s,now,plan)
+                self.fence_violation=None
             elif command=='return':actions=self.mission.return_home(s,now)
             elif command=='land':actions=self.mission.land(s,now)
             elif command=='stop':
@@ -305,7 +336,13 @@ class Agent:
                 last_nodes=now
             with self.lock:
                 before=self.mission.phase
-                try:self.perform(self.mission.tick(self.snapshot(),now))
+                try:
+                    if self.fence_violation and self.mission.phase in {'TAKEOFF','OUTBOUND','RETURNING'}:
+                        fault=self.fence_violation;self.fence_violation=None
+                        state=self.snapshot()
+                        if state.get('mode')=='OFFBOARD':self.perform(self.mission.land(state,now,fault))
+                        else:self.perform(self.mission.tick(state,now))
+                    else:self.perform(self.mission.tick(self.snapshot(),now))
                 except Exception as e:self.failure(e)
                 if before!=self.mission.phase:self.log('任务状态：'+self.mission.phase+' '+self.mission.reason)
             time.sleep(.1)
