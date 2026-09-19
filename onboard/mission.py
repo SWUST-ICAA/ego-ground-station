@@ -47,10 +47,10 @@ class Mission:
             if len(point) != 2:
                 raise ValueError('每个航点需要 x/y')
             x, y = map(float, point)
-            if not math.isfinite(x+y) or not abs(x) < 48.7 or not abs(y) < 23.7:
-                raise ValueError('航点超出当前地图边界（|x|<48.7m，|y|<23.7m）')
+            if not math.isfinite(x+y) or not abs(x) < 498.7 or not abs(y) < 498.7:
+                raise ValueError('航点超出当前地图边界（|x|<498.7m，|y|<498.7m）')
             validated.append([x, y, 1.5])
-        if abs(pos[0]) >= 48.7 or abs(pos[1]) >= 23.7:
+        if abs(pos[0]) >= 498.7 or abs(pos[1]) >= 498.7:
             raise ValueError('起飞点超出规划地图')
         fence=None;returns=[]
         if plan is not None:

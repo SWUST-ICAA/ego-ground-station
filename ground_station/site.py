@@ -1,7 +1,7 @@
 """Site profiles and ground-side routes. Competition coordinates from subject 3."""
 import copy
 import math
-from onboard.fence import Fence
+from onboard.fence import Fence, LIMITS
 from onboard.geo import to_local
 
 # Latitude, longitude in decimal degrees; datum must be confirmed by operator.
@@ -24,14 +24,26 @@ def build_plan(profile,targets,state):
         polygon=[to_local(lat,lon,anchor) for lat,lon in COMPETITION]
     elif profile['mode']=='test':polygon=profile['polygon']
     else:raise ValueError('未知场地模式')
+    if profile['mode']=='competition' and any(not (LIMITS[0]<p[0]<LIMITS[1] and LIMITS[2]<p[1]<LIMITS[3]) for p in polygon):
+        raise ValueError('场地转换后超出 1000×1000m 地图，请检查本机原点和坐标参考')
     fence=Fence(polygon,profile['margin']);start=list(state['position'][:2]);last=start;points=[]
     if not targets:raise ValueError('请先设置目标点')
     for p in targets:
         goal=to_local(p['a'],p['b'],anchor) if p['kind']=='geo' else [p['a'],p['b']]
-        points.extend(fence.route(last,goal));last=goal
-    returns=fence.route(last,start)
+        points.extend(split_legs(last,fence.route(last,goal)));last=goal
+    returns=split_legs(last,fence.route(last,start))
     if len(points)>50 or len(returns)>50:raise ValueError('搜索结果超过 50 个途经点，请减少目标或简化场地')
     return dict(waypoints=[dict(kind='local',a=p[0],b=p[1]) for p in points],
                 flight_plan=dict(polygon=polygon,margin=fence.margin,mode=profile['mode'],
                                  origin=start,return_points=returns,geo_anchor=anchor if uses_geo else None),
                 preview=dict(polygon=polygon,margin=fence.margin,outbound=[start]+points,return_path=[last]+returns))
+
+
+def split_legs(start,route):
+    # Keep each leg comfortably below the onboard 120s timeout at 1.2m/s.
+    result=[];a=start
+    for b in route:
+        steps=max(1,math.ceil(math.dist(a,b)/60.))
+        result.extend([[a[j]+(b[j]-a[j])*i/steps for j in (0,1)] for i in range(1,steps+1)])
+        a=b
+    return result

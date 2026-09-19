@@ -41,8 +41,8 @@ class WaypointEditor(W.QWidget):
     def change_kind(self,*args):
         geo=self.kind.currentData()=='geo'
         self.a_label.setText('纬度 (°)' if geo else 'X (m)');self.b_label.setText('经度 (°)' if geo else 'Y (m)')
-        self.a.setPlaceholderText('-90 ～ 90' if geo else '-48.7 < X < 48.7')
-        self.b.setPlaceholderText('-180 ～ 180' if geo else '-23.7 < Y < 23.7')
+        self.a.setPlaceholderText('-90 ～ 90' if geo else '-498.7 < X < 498.7')
+        self.b.setPlaceholderText('-180 ～ 180' if geo else '-498.7 < Y < 498.7')
         self.a.clear();self.b.clear();self.update_actions()
 
     def set_aircraft(self,n,points):
@@ -75,7 +75,7 @@ class WaypointEditor(W.QWidget):
         try:
             a,b=float(self.a.text()),float(self.b.text())
             if not all(math.isfinite(v) for v in (a,b)):raise ValueError('请输入有限数值。')
-            if kind=='local' and not (abs(a)<48.7 and abs(b)<23.7):raise ValueError('米制范围：|X| < 48.7m，|Y| < 23.7m。')
+            if kind=='local' and not (abs(a)<498.7 and abs(b)<498.7):raise ValueError('米制范围：|X| < 498.7m，|Y| < 498.7m。')
             if kind=='geo' and not (-90<=a<=90 and -180<=b<=180):raise ValueError('纬度应在 ±90°，经度应在 ±180° 内。')
         except ValueError as e:
             self.message.setText('坐标无效：'+(str(e) if 'could not convert' not in str(e) else '请完整填写两个数字。'));self.logMessage.emit(f'{self.aircraft} 号 · '+self.message.text());return

@@ -3,7 +3,7 @@ import heapq
 import math
 
 EPS=1e-7
-LIMITS=(-48.7,48.7,-23.7,23.7)
+LIMITS=(-498.7,498.7,-498.7,498.7)
 
 
 def xy(p):
@@ -73,11 +73,12 @@ class Fence:
         return bool(pts) and all(self.segment(a,b) for a,b in zip(pts,pts[1:]+pts[:1]))
 
     def route(self,start,goal,extra=.5):
-        """A* on 0.5m cells; every edge and simplification has exact clearance checks."""
+        """A* on 0.5–2m cells; every edge and simplification has exact clearance checks."""
         start,goal=xy(start),xy(goal)
         if not self.contains(start,extra) or not self.contains(goal,extra):raise ValueError('起点或目标不在内缩边界/现有规划地图内，或未留出 0.5m 跟踪余量')
         if self.segment(start,goal,extra):return [list(goal)]
-        step=.5;cache={};parents={};cost={};queue=[]
+        span=max(max(p[i] for p in self.polygon)-min(p[i] for p in self.polygon) for i in (0,1))
+        step=max(.5,min(2.,span/200));cache={};parents={};cost={};queue=[]
         def pt(k):return (k[0]*step,k[1]*step)
         def valid(k):
             if k not in cache:cache[k]=self.contains(pt(k),extra)
@@ -93,9 +94,9 @@ class Fence:
             _,g,k=heapq.heappop(queue)
             if g!=cost[k]:continue
             visited+=1
-            if visited>22000:raise ValueError('航线搜索超出限制')
+            if visited>100000:raise ValueError('航线搜索超出限制')
             p=pt(k)
-            if math.dist(p,goal)<=1.0 and self.segment(p,goal,extra):found=k;break
+            if math.dist(p,goal)<=2*step and self.segment(p,goal,extra):found=k;break
             for dx,dy in ((1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)):
                 nxt=(k[0]+dx,k[1]+dy);q=pt(nxt);ng=g+step*math.hypot(dx,dy)
                 if ng>=cost.get(nxt,float('inf')) or not valid(nxt) or not self.segment(p,q,extra):continue
