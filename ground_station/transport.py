@@ -6,6 +6,7 @@ import shlex
 import time
 import uuid
 import paramiko
+from onboard.flight_parameters import validate, same
 
 ROOT=Path(__file__).resolve().parents[1]
 CONTAINER='fast-drone-250'
@@ -72,12 +73,12 @@ class Remote:
 
     def rpc(self, command, **params):
         payload=dict(command=command,**params)
-        if command not in {'status','observe'}:payload['id']=uuid.uuid4().hex
+        if command not in {'status','observe','parameters'}:payload['id']=uuid.uuid4().hex
         try:
             out=self.shell('docker exec -i '+CONTAINER+' '+ENTRY+' python3 '+AGENT+' request',json.dumps(payload,allow_nan=False),timeout=25)
             result=json.loads(out)
         except Exception as e:
-            if command not in {'status','prepare','observe'}:
+            if command not in {'status','prepare','observe','parameters'}:
                 raise RuntimeError('命令结果未确认，请刷新状态；不会自动重发：'+str(e)) from e
             raise
         if not result.get('ok'):raise RuntimeError(result.get('error','操作失败'))
@@ -125,24 +126,68 @@ class Remote:
         self.shell('mkdir -p '+shlex.quote(destination))
         sftp=self.client.open_sftp()
         try:
-            for name in ('agent.py','mission.py','geo.py','fence.py','visualization.py'):
+            for name in ('agent.py','mission.py','geo.py','fence.py','visualization.py','flight_parameters.py'):
                 sftp.put(str(ROOT/'onboard'/name),destination+'/'+name)
         finally:sftp.close()
         self.shell('docker exec '+CONTAINER+' mkdir -p /tmp/ground_station')
-        for name in ('agent.py','mission.py','geo.py','fence.py','visualization.py'):
+        for name in ('agent.py','mission.py','geo.py','fence.py','visualization.py','flight_parameters.py'):
             self.shell('docker cp '+shlex.quote(destination+'/'+name)+' '+CONTAINER+':/tmp/ground_station/'+name)
         self.shell('docker exec -d '+CONTAINER+' '+ENTRY+' python3 '+AGENT+' serve --aircraft '+str(int(self.config['id'])))
-        for attempt in range(15):
+        for attempt in range(40):
             time.sleep(.4)
             try:return self.rpc('status')['status']
             except Exception:
-                if attempt==14:raise
+                if attempt==39:raise
 
     def stop_program(self):
         # Container shutdown never bypasses the onboard, fresh landed/unarmed check.
         self.rpc('stop')
         self.shell('docker stop -t 10 '+CONTAINER)
         return dict(program=False,connected=False,ready=False,mission=dict(phase='STOPPED'))
+
+    def parameter_files(self, command, values=None):
+        self.connect()
+        destination='/home/'+self.config['user']+'/.fast-drone-ground-station'
+        root='/home/'+self.config['user']+'/Fast-Drone-250'
+        self.shell('mkdir -p '+shlex.quote(destination))
+        sftp=self.client.open_sftp()
+        try:sftp.put(str(ROOT/'onboard/flight_parameters.py'),destination+'/flight_parameters.py')
+        finally:sftp.close()
+        return json.loads(self.shell('python3 '+shlex.quote(destination+'/flight_parameters.py')+' '+command+
+                                     ' --root '+shlex.quote(root)+' --aircraft '+str(int(self.config['id'])),
+                                     json.dumps(values,allow_nan=False) if values is not None else None))
+
+    def get_parameters(self):
+        state=self.status()
+        image_info=json.loads(self.shell("docker inspect -f '{{json .Config.Labels}}' "+CONTAINER)) or {}
+        supported=image_info.get('fast-drone.flight-parameters')=='1'
+        saved=self.parameter_files('read')['values']
+        if state.get('program'):
+            if 'flight-parameters-v1' not in state.get('capabilities',[]):
+                raise RuntimeError('机载代理尚未支持参数回读，请着陆后更新代理')
+            result=self.rpc('parameters')
+            values=validate(result['parameters']);supported=supported and result['supported']
+            if not same(saved,values):raise RuntimeError('运行值与保存值不一致，请关闭程序后重新启动')
+        else:values=saved
+        return dict(values=values,program=state.get('program',False),supported=supported,
+                    source='运行值已与保存值核对' if state.get('program') else '已保存；下次启动生效')
+
+    def apply_parameters(self, values):
+        values=validate(values)
+        before=self.get_parameters()
+        if not before['supported']:raise RuntimeError('机上镜像尚未支持参数设置，请先更新此飞机的规划器镜像')
+        was_running=before['program']
+        # stop_program repeats fresh landed/unarmed/inactive checks inside the aircraft.
+        if was_running:self.stop_program()
+        saved=self.parameter_files('write',values)
+        try:
+            if was_running:self.start_program()
+            actual=self.get_parameters()
+            if not same(actual['values'],values):raise RuntimeError('应用后参数回读不一致')
+        except Exception as e:
+            raise RuntimeError('参数已保存，运行结果未确认；请读取参数检查后再启动。备份：'+str(saved['backup'])+'；'+str(e)) from e
+        actual['backup']=saved['backup']
+        return actual
 
     def execute(self, command, **kwargs):
         if command=='start_program':return self.start_program()

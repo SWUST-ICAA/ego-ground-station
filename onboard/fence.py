@@ -46,7 +46,8 @@ def hull(points):
 
 
 class Fence:
-    def __init__(self,polygon,margin):
+    def __init__(self,polygon,margin,limits=LIMITS):
+        self.limits=limits
         self.polygon=[xy(p) for p in polygon];self.margin=float(margin)
         if not 3<=len(self.polygon)<=64 or not math.isfinite(self.margin) or self.margin<.75:
             raise ValueError('边界需要 3～64 点；内缩距离至少为机体半径 0.75m')
@@ -62,7 +63,7 @@ class Fence:
         for a,b in self.edges:
             if distance((x,y),a,b)<self.margin+extra-EPS:return False
             if (a[1]>y)!=(b[1]>y) and x<(b[0]-a[0])*(y-a[1])/(b[1]-a[1])+a[0]:inside=not inside
-        return inside and LIMITS[0]<x<LIMITS[1] and LIMITS[2]<y<LIMITS[3]
+        return inside and self.limits[0]<x<self.limits[1] and self.limits[2]<y<self.limits[3]
 
     def segment(self,a,b,extra=0.):
         a,b=xy(a),xy(b)

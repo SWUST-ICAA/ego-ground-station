@@ -15,9 +15,11 @@ import time
 from geo import to_local
 from mission import Mission
 from visualization import project_cloud, sample_bspline
+from flight_parameters import NAMESPACE, ROS_KEYS, runtime_parameters, same, validate
+from pathlib import Path
 
 SOCKET = '/tmp/fast-drone-ground-station.sock'
-VERSION = '1.4.0'
+VERSION = '1.5.0'
 
 
 def request(payload):
@@ -54,7 +56,23 @@ class Agent:
         self.samples = collections.deque(maxlen=10)
         self.anchor = None
         self.last_fix_stamp = None
-        self.mission = Mission()
+        saved = Path('/aircraft/flight_parameters.json')
+        if saved.exists():
+            deadline=time.monotonic()+5
+            while time.monotonic()<deadline:
+                if (all(rospy.has_param(NAMESPACE+key) for key in ROS_KEYS.values()) and
+                        rospy.get_param(NAMESPACE+'fsm/parameter_control_version',0)==1):break
+                time.sleep(.1)
+        self.parameters = runtime_parameters(rospy)
+        self.parameter_fault = ''
+        if saved.exists():
+            try:
+                if not same(validate(json.loads(saved.read_text())),self.parameters):
+                    raise ValueError('启动参数与保存配置不一致')
+                if rospy.get_param(NAMESPACE+'fsm/parameter_control_version',0)!=1:
+                    raise ValueError('规划器镜像尚未支持可配置航点高度')
+            except Exception as e:self.parameter_fault = str(e)
+        self.mission = Mission(self.parameters)
         self.history = collections.OrderedDict()
         self.events = collections.deque(maxlen=60)
         self.traj_seq = 0
@@ -154,7 +172,8 @@ class Agent:
         points = []
         if position and cloud and map_age <= 2:
             raw = point_cloud2.read_points(cloud[0], field_names=('x','y','z'), skip_nans=True)
-            points = project_cloud(raw, position[:2])
+            points = project_cloud(raw, position[:2],z_min=self.parameters['ground_height'],
+                                   z_max=self.parameters['ground_height']+self.parameters['map_size_z'])
         curve = []
         if traj and traj_age <= 2 and traj[0].order == 3:
             msg = traj[0]
@@ -241,13 +260,14 @@ class Agent:
         battery=None
         if batt and math.isfinite(batt.percentage) and 0<=batt.percentage<=1:
             battery=round(batt.percentage*100,1)
+        if self.parameter_fault:ready=False;reasons.append(self.parameter_fault)
         return dict(aircraft=self.aircraft,version=VERSION,session_id=self.session_id,connected=bool(state and state.connected),fresh=fresh,
                     ready=ready,reasons=reasons,source_age_sec=source_age_sec,bridge_reason=bridge_status.get('reason'),
                     armed=bool(state and state.armed),landed=bool(ext and ext.landed_state==1),
                     mode=state.mode if state else 'UNKNOWN',position=pos,speed=speed,yaw=yaw,battery=battery,
                     voltage=batt.voltage if batt and math.isfinite(batt.voltage) else None,
-                    capabilities=['fence-v1','flight-v2','planner-view-v1','telemetry-stream-v1'],geo_anchor=dict(self.anchor) if self.anchor else None,velocity=velocity,
-                    command_age=max(0.,now-self.last_forwarded),
+                    capabilities=['fence-v1','flight-v2','planner-view-v1','telemetry-stream-v1','flight-parameters-v1'],geo_anchor=dict(self.anchor) if self.anchor else None,velocity=velocity,
+                    command_age=max(0.,now-self.last_forwarded),flight_parameters=dict(self.parameters),
                     gps=gps_info,geo_ready=bool(gps_valid and self.anchor and heading and pos),
                     bridge_ready=bridge_ready,cloud_points=points,controller='/px4_controller' in node_set,
                     traj_seq=self.traj_seq,mission=self.mission.status(),events=list(self.events),stopping=self.stopping)
@@ -272,7 +292,8 @@ class Agent:
             elif action=='controller_start':
                 self.controller_log=open('/tmp/ground-station-controller.log','a')
                 self.controller=subprocess.Popen(['rosrun','controller','px4_controller_node','__name:=px4_controller',
-                     '_position_cmd_topic:=/ground_station/position_cmd'],stdout=self.controller_log,stderr=subprocess.STDOUT,start_new_session=True)
+                     '_position_cmd_topic:=/ground_station/position_cmd',
+                     '_takeoff_height:='+str(self.parameters['takeoff_height'])],stdout=self.controller_log,stderr=subprocess.STDOUT,start_new_session=True)
                 time.sleep(2.2)
                 if self.controller.poll() is not None:raise RuntimeError('控制器启动失败')
             elif action=='arm':
@@ -327,6 +348,12 @@ class Agent:
         with self.lock:
             command=req.get('command')
             if command=='status':return dict(ok=True,status=self.snapshot())
+            if command=='parameters':
+                current=runtime_parameters(self.rospy)
+                if not same(current,self.parameters):raise ValueError('运行参数已变化，请着陆后重启程序')
+                if self.parameter_fault:raise ValueError(self.parameter_fault)
+                return dict(ok=True,parameters=current,
+                            supported=self.rospy.get_param(NAMESPACE+'fsm/parameter_control_version',0)==1)
             token=req.get('id')
             if not isinstance(token,str) or not 8<=len(token)<=80:raise ValueError('请求缺少唯一 id')
             if token in self.history:return self.history[token]
@@ -352,7 +379,7 @@ class Agent:
                     elif p.get('kind')=='local':points.append([p['a'],p['b']])
                     else:raise ValueError('未知航点类型')
                 if command=='prepare':
-                    Mission().start(points,s,now,plan)
+                    Mission(self.parameters).start(points,s,now,plan)
                     response=dict(ok=True,status=self.snapshot(),resolved_points=points)
                     self.history[token]=response
                     return response

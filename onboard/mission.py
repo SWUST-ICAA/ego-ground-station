@@ -2,15 +2,20 @@
 import math
 try:
     from .fence import Fence, xy
+    from .flight_parameters import DEFAULTS, validate, map_limits
 except ImportError:
     from fence import Fence, xy
+    from flight_parameters import DEFAULTS, validate, map_limits
 
 TERMINAL = {'IDLE', 'COMPLETE', 'ERROR', 'MANUAL'}
-FLIGHT_HEIGHT = 1.2
 
 
 class Mission:
-    def __init__(self):
+    def __init__(self, parameters=None):
+        self.parameters = validate(DEFAULTS if parameters is None else parameters)
+        self.flight_height = self.parameters["takeoff_height"]
+        margin = self.parameters["obstacles_inflation"] + .3
+        self.bounds = [self.parameters["map_size_"+axis]/2-margin for axis in "xy"]
         self.phase = 'IDLE'
         self.reason = ''
         self.points = []
@@ -49,10 +54,10 @@ class Mission:
             if len(point) != 2:
                 raise ValueError('每个航点需要 x/y')
             x, y = map(float, point)
-            if not math.isfinite(x+y) or not abs(x) < 498.7 or not abs(y) < 498.7:
-                raise ValueError('航点超出当前地图边界（|x|<498.7m，|y|<498.7m）')
-            validated.append([x, y, FLIGHT_HEIGHT])
-        if abs(pos[0]) >= 498.7 or abs(pos[1]) >= 498.7:
+            if not math.isfinite(x+y) or not abs(x) < self.bounds[0] or not abs(y) < self.bounds[1]:
+                raise ValueError('航点超出当前地图边界（|x|<%.2fm，|y|<%.2fm）'%tuple(self.bounds))
+            validated.append([x, y, self.flight_height])
+        if abs(pos[0]) >= self.bounds[0] or abs(pos[1]) >= self.bounds[1]:
             raise ValueError('起飞点超出规划地图')
         fence=None;returns=[]
         if plan is not None:
@@ -64,7 +69,7 @@ class Mission:
                 if yaw is None or abs(math.atan2(math.sin(yaw-values[2]),math.cos(yaw-values[2])))>.05:
                     raise ValueError('机头方向已变化，请重新搜索航线')
             if plan.get('mode') not in {'test','competition'}:raise ValueError('围栏模式无效')
-            fence=Fence(plan['polygon'],plan['margin'])
+            fence=Fence(plan['polygon'],plan['margin'],map_limits(self.parameters))
             if math.dist(pos[:2],xy(plan['origin']))>.3:raise ValueError('起点已变化，请重新搜索航线')
             last=pos[:2]
             for point in validated:
@@ -73,24 +78,27 @@ class Mission:
             raw=plan['return_points']
             if not 1<=len(raw)<=50:raise ValueError('返航途经点数量无效')
             for point in raw:
+                if len(point)!=2 or not all(math.isfinite(float(v)) for v in point) or any(abs(float(v))>=bound for v,bound in zip(point,self.bounds)):
+                    raise ValueError('返航航点超出当前地图边界')
                 if not fence.segment(last,point,.3):raise ValueError('返航航线超出围栏或余量不足')
-                returns.append([float(point[0]),float(point[1]),FLIGHT_HEIGHT]);last=point
+                returns.append([float(point[0]),float(point[1]),self.flight_height]);last=point
             if math.dist(last,pos[:2])>.3:raise ValueError('返航终点与起飞点不一致')
             previous=returns[-2][:2] if len(returns)>1 else validated[-1][:2]
             if not fence.segment(previous,pos[:2],.3):raise ValueError('起飞点不在返航安全区')
-            returns[-1]=[pos[0],pos[1],FLIGHT_HEIGHT]
+            returns[-1]=[pos[0],pos[1],self.flight_height]
         self.fence=fence;self.return_points=returns;self.return_index=0
         self.local_frame=dict(plan['local_frame']) if plan and plan.get('local_frame') else None
         self.skipped=[]
         self.requires_geo=bool(plan and (plan.get('mode')=='competition' or plan.get('geo_anchor')))
-        self.visited=[[pos[0],pos[1],FLIGHT_HEIGHT]]
-        self.points, self.home, self.index = validated, [pos[0], pos[1], FLIGHT_HEIGHT], 0
+        self.visited=[[pos[0],pos[1],self.flight_height]]
+        self.points, self.home, self.index = validated, [pos[0], pos[1], self.flight_height], 0
         self.seen_offboard = False
         self.transition('ARMING', now)
         return [('controller_start', None), ('arm', None)]
 
     def send_goal(self, point, state, now, phase):
         self.transition(phase, now)
+        self.goal_timeout=max(120.,30.+3.*math.dist(state['position'],point)/self.parameters['max_vel'])
         self.traj_base = state.get('traj_seq', 0)
         self.progress_position=list(state['position']);self.progress_time=now
         return [('goal', point)]
@@ -235,8 +243,8 @@ class Mission:
                 return self.send_goal(self.points[self.index], state, now, 'OUTBOUND')
             reason=''
             if now-self.since>3 and state.get('command_age',0)>3:reason='有效跟踪指令中断超过 3 秒'
-            elif now-self.progress_time>10 and math.dist(state['position'],target)>.45:reason='连续 10 秒位置无进展'
-            elif now-self.since>120:reason='当前航点执行超过 120 秒'
+            elif now-self.progress_time>max(10.,2.+.9/self.parameters['max_vel']) and math.dist(state['position'],target)>.45:reason='持续位置无进展'
+            elif now-self.since>self.goal_timeout:reason='当前航点执行超过 %.0f 秒'%self.goal_timeout
             elif now-self.since>12 and state.get('traj_seq',0)<=self.traj_base:reason='规划器未生成轨迹'
             if reason:return self.skip_blocked(state,now,reason)
         return []

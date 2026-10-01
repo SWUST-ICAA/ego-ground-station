@@ -11,6 +11,7 @@ from .transport import Remote
 from .demo import Demo
 from .view_widgets import AllCheckBox, MapPanel, SelectCheckBox, StatusTable
 from .planner_view import PlannerView
+from .parameter_widget import ParameterWidget
 from .waypoint_editor import WaypointEditor
 from .site_widget import SiteWidget
 from .site import build_plan
@@ -25,6 +26,7 @@ class Worker(QtCore.QThread):
     state=QtCore.pyqtSignal(int,dict)
     result=QtCore.pyqtSignal(int,str,bool,str)
     observation=QtCore.pyqtSignal(int,dict)
+    parameters=QtCore.pyqtSignal(int,dict)
     def __init__(self,config,demo):
         super().__init__();self.n=config['id'];self.backend=Demo(config) if demo else Remote(config)
         self.commands=queue.Queue();self.halt=threading.Event();self.pending=False;self.observe_enabled=False
@@ -40,13 +42,17 @@ class Worker(QtCore.QThread):
                 except queue.Empty:command=None
                 if command:
                     try:
-                        state=self.backend.execute(command,**params)
+                        if command in {'get_parameters','apply_parameters'}:
+                            data=self.backend.get_parameters() if command=='get_parameters' else self.backend.apply_parameters(params['values'])
+                            self.parameters.emit(self.n,data)
+                            state=self.backend.status()
+                        else:state=self.backend.execute(command,**params)
                         state.setdefault('program',command!='stop_program')
                         state['online']=True;latest=state
                         self.state.emit(self.n,state);self.result.emit(self.n,command,True,'完成')
                     except Exception as e:self.result.emit(self.n,command,False,str(e))
                     finally:self.pending=False
-                    if command in {'start_program','stop_program'}:
+                    if command in {'start_program','stop_program','apply_parameters'}:
                         if status_stream:status_stream.close();status_stream=None
                         if observe_stream:observe_stream.close();observe_stream=None
                         last_stream_try=0
@@ -141,6 +147,7 @@ class Window(W.QMainWindow):
             self.table.item(row,1).setText(f"{a['id']} 号  {a['host']}");self.table.setRowHeight(row,44)
             worker=Worker(a,demo);worker.state.connect(self.on_state);worker.result.connect(self.on_result);self.workers[a['id']]=worker
             worker.observation.connect(self.on_observation)
+            worker.parameters.connect(self.on_parameters)
             n=a['id'];button=W.QPushButton('连接 SSH');button.setStyleSheet('padding:6px 10px')
             button.clicked.connect(lambda checked=False,n=n:self.connect_aircraft(n));self.connect_buttons[n]=button;self.table.setCellWidget(row,9,button)
             self.table.item(row,2).setText('未连接')
@@ -162,7 +169,7 @@ class Window(W.QMainWindow):
         self.waypoint_editor=WaypointEditor();editor_tabs.insertTab(0,self.waypoint_editor,'目标点');editor_tabs.setCurrentIndex(0)
         self.waypoint_editor.pointsChanged.connect(self.save_points)
         self.waypoint_editor.logMessage.connect(self.write_log)
-        text=W.QLabel('米制：搜索时位置为原点、机头为前，X 向右、Y 向前；飞行中方向固定。经纬度：WGS84。\n移动或转动飞机后请重新搜索航线。最后返回起飞点并降落，高度 1.2m。');text.setWordWrap(True);text.setObjectName('muted');ll.addWidget(text)
+        text=W.QLabel('米制：搜索时位置为原点、机头为前，X 向右、Y 向前；飞行中方向固定。经纬度：WGS84。\n移动或转动飞机后请重新搜索航线。最后返回起飞点并降落，高度以机上参数设置为准。');text.setWordWrap(True);text.setObjectName('muted');ll.addWidget(text)
         self.details=W.QLabel('等待遥测');self.details.setWordWrap(True);ll.addWidget(self.details)
         editor=W.QScrollArea();editor.setWidgetResizable(True);editor.setFrameShape(W.QFrame.NoFrame);editor.setWidget(left);editor.setMinimumSize(350,150)
         splitter.addWidget(editor)
@@ -171,6 +178,11 @@ class Window(W.QMainWindow):
         self.map_panel=MapPanel([a['id'] for a in config['aircraft']]);self.view_tabs.addTab(self.map_panel,'航线总览')
         self.planner_view=PlannerView();self.planner_view.show_aircraft(self.current)
         self.view_tabs.addTab(self.planner_view,'局部规划观察')
+        self.parameter_widget=ParameterWidget();self.parameter_widget.show_aircraft(self.current)
+        parameter_scroll=W.QScrollArea();parameter_scroll.setWidgetResizable(True);parameter_scroll.setFrameShape(W.QFrame.NoFrame)
+        parameter_scroll.setWidget(self.parameter_widget);self.view_tabs.addTab(parameter_scroll,'参数设置')
+        self.parameter_widget.readRequested.connect(lambda:self.parameter_command('get_parameters'))
+        self.parameter_widget.applyRequested.connect(lambda values:self.parameter_command('apply_parameters',values))
         self.view_tabs.currentChanged.connect(self.update_observer)
         for n,plot in self.map_panel.plots.items():plot.clicked.connect(self.select_aircraft)
         self.table.cellClicked.connect(lambda row,col:self.select_aircraft(self.config['aircraft'][row]['id']) if col else None)
@@ -231,7 +243,7 @@ class Window(W.QMainWindow):
     def load_points(self):
         self.waypoint_editor.set_aircraft(self.current,self.points(self.current));self.refresh_detail()
     def switch(self):
-        self.current=self.selector.currentData();self.load_points();self.update_observer()
+        self.current=self.selector.currentData();self.parameter_widget.show_aircraft(self.current);self.load_points();self.update_observer()
     def update_observer(self,*args):
         viewing=self.view_tabs.currentIndex()==1
         self.planner_view.show_aircraft(self.current)
@@ -286,8 +298,18 @@ class Window(W.QMainWindow):
             params={k:self.plans[n][k] for k in ('waypoints','flight_plan')} if command=='start' else {}
             self.workers[n].submit(command,params)
             self.write_log(f'{n} 号 · 已提交 {command}；各机独立接受/拒绝，非同步起飞保证')
+    def parameter_command(self,command,values=None):
+        n=self.current
+        if self.workers[n].submit(command,dict(values=values) if values is not None else {}):
+            self.write_log(f'{n} 号 · 已提交参数'+('读取' if command=='get_parameters' else '保存'))
+        else:self.write_log(f'{n} 号 · 请先连接并等待当前操作完成')
+    def on_parameters(self,n,data):
+        self.parameter_widget.receive(n,data)
     def on_result(self,n,command,ok,text):
         self.write_log(f'{n} 号 · {command} '+('成功' if ok else '失败')+'：'+text)
+        if command=='apply_parameters':
+            self.plans.pop(n,None);self.plan_keys.pop(n,None)
+            if n==self.current and not ok:self.parameter_widget.info.setText(text)
     def on_state(self,n,state):
         if 'online' not in state:state['online']=True
         if state.get('online'):
@@ -349,6 +371,7 @@ class Window(W.QMainWindow):
             self.table.item(row,7).setText(' / '.join(f'{v:.2f}' for v in from_map(pos,ref)) if pos and ref else '—')
             self.table.item(row,7).setToolTip('X 向右、Y 向前，相对起飞参考点；Z 为机载地图高度')
         s=self.states.get(self.current,{});fresh=time.monotonic()-self.received.get(self.current,0)<3
+        self.parameter_widget.set_status(s,fresh,self.workers[self.current].pending)
         geo=self.geo_available(self.current);self.waypoint_editor.set_status(s,fresh,geo)
         self.notice.setText('经纬度和米制坐标均可设置。' if geo else '持续检测 GNSS 与坐标参考，可用后自动开放经纬度点；当前可设置米制点。')
         m=s.get('mission',{});gps=s.get('gps');parts=[]

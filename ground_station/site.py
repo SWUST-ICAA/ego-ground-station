@@ -1,7 +1,8 @@
 """Site profiles and ground-side routes. Competition coordinates from subject 3."""
 import copy
 import math
-from onboard.fence import Fence, LIMITS
+from onboard.fence import Fence
+from onboard.flight_parameters import DEFAULTS, map_limits, validate
 from onboard.geo import to_local
 from .frame import reference, to_map
 
@@ -27,9 +28,10 @@ def build_plan(profile,targets,state):
         polygon=[to_local(lat,lon,anchor) for lat,lon in COMPETITION]
     elif profile['mode']=='test':polygon=[to_map(p,frame) for p in profile['polygon']]
     else:raise ValueError('未知场地模式')
-    if profile['mode']=='competition' and any(not (LIMITS[0]<p[0]<LIMITS[1] and LIMITS[2]<p[1]<LIMITS[3]) for p in polygon):
-        raise ValueError('场地转换后超出 1000×1000m 地图，请检查本机原点和坐标参考')
-    fence=Fence(polygon,profile['margin']);start=list(state['position'][:2]);last=start;points=[]
+    limits=map_limits(validate(state.get('flight_parameters',DEFAULTS)))
+    if profile['mode']=='competition' and any(not (limits[0]<p[0]<limits[1] and limits[2]<p[1]<limits[3]) for p in polygon):
+        raise ValueError('场地转换后超出当前地图，请检查地图尺寸、本机原点和坐标参考')
+    fence=Fence(polygon,profile['margin'],limits);start=list(state['position'][:2]);last=start;points=[]
     if not targets:raise ValueError('请先设置目标点')
     for p in targets:
         if p['kind']=='local' and p.get('frame')!='right-forward':
@@ -45,7 +47,7 @@ def build_plan(profile,targets,state):
 
 
 def split_legs(start,route):
-    # Keep each leg comfortably below the onboard 120s timeout at 1.2m/s.
+    # Limit route segment length; onboard deadlines also account for configured speed.
     result=[];a=start
     for b in route:
         steps=max(1,math.ceil(math.dist(a,b)/60.))

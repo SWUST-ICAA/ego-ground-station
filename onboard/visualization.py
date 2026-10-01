@@ -3,13 +3,13 @@ import bisect
 import math
 
 
-def project_cloud(points, center, radius=8.0, limit=1800):
-    """Project the inflated occupancy cloud in the configured 1.0–1.4 m band."""
+def project_cloud(points, center, radius=8.0, limit=1800, z_min=1.0, z_max=1.4):
+    """Project the inflated occupancy cloud throughout the selected map height."""
     cells = {}
     for x, y, z in points:
         if not all(math.isfinite(v) for v in (x, y, z)):
             continue
-        if not (1.0 <= z <= 1.4 and abs(x-center[0]) <= radius and abs(y-center[1]) <= radius):
+        if not (z_min <= z <= z_max and abs(x-center[0]) <= radius and abs(y-center[1]) <= radius):
             continue
         key = (math.floor(x*4), math.floor(y*4))
         old = cells.get(key)
