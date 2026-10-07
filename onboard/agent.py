@@ -14,7 +14,7 @@ import threading
 import time
 from geo import to_local
 from mission import Mission
-from visualization import project_cloud, sample_bspline
+from visualization import project_cloud, sample_bspline, polynomial_hulls, sample_polynomial
 from flight_parameters import NAMESPACE, ROS_KEYS, runtime_parameters, same, validate
 from pathlib import Path
 
@@ -44,7 +44,11 @@ class Agent:
         from nav_msgs.msg import Odometry
         from std_msgs.msg import String, Float64
         from geometry_msgs.msg import PoseStamped
-        from traj_utils.msg import Bspline
+        self.diff_planner = rospy.get_param('/navigation_stack','') == 'diff-planner-px4'
+        if self.diff_planner:
+            from traj_utils.msg import PolyTraj as TrajectoryMessage
+        else:
+            from traj_utils.msg import Bspline as TrajectoryMessage
         from quadrotor_msgs.msg import PositionCommand
         self.rospy = rospy
         self.aircraft = aircraft
@@ -57,7 +61,7 @@ class Agent:
         self.anchor = None
         self.last_fix_stamp = None
         saved = Path('/aircraft/flight_parameters.json')
-        if saved.exists():
+        if saved.exists() and not self.diff_planner:
             deadline=time.monotonic()+5
             while time.monotonic()<deadline:
                 if (all(rospy.has_param(NAMESPACE+key) for key in ROS_KEYS.values()) and
@@ -69,10 +73,10 @@ class Agent:
             try:
                 if not same(validate(json.loads(saved.read_text())),self.parameters):
                     raise ValueError('启动参数与保存配置不一致')
-                if rospy.get_param(NAMESPACE+'fsm/parameter_control_version',0)!=1:
+                if not self.diff_planner and rospy.get_param(NAMESPACE+'fsm/parameter_control_version',0)!=1:
                     raise ValueError('规划器镜像尚未支持可配置航点高度')
             except Exception as e:self.parameter_fault = str(e)
-        self.mission = Mission(self.parameters)
+        self.mission = Mission(self.parameters,rolling_map=self.diff_planner)
         self.history = collections.OrderedDict()
         self.events = collections.deque(maxlen=60)
         self.traj_seq = 0
@@ -97,7 +101,8 @@ class Agent:
         rospy.Subscriber('/mavros/battery', BatteryState, lambda m:self.store('battery',m))
         rospy.Subscriber('/cloud_registered', PointCloud2, lambda m:self.store('cloud',m),queue_size=1)
         rospy.Subscriber('/drone_%d_fastlio/bridge_status'%(aircraft-1), String, lambda m:self.store('bridge',m))
-        rospy.Subscriber('/drone_0_planning/bspline', Bspline, self.traj_cb, queue_size=5)
+        trajectory_topic = '/drone_0_planning/trajectory' if self.diff_planner else '/drone_0_planning/bspline'
+        rospy.Subscriber(trajectory_topic, TrajectoryMessage, self.traj_cb, queue_size=5)
         self.log('观测代理已启动；未启动控制器、未解锁')
 
     def log(self, text):
@@ -118,6 +123,15 @@ class Agent:
             self.traj_seq += 1
             self.store('traj',msg)
             if msg.start_time.to_sec() >= self.goal_stamp:
+                if self.diff_planner:
+                    try:
+                        hulls = polynomial_hulls(msg)
+                        if self.mission.fence and any(not self.mission.fence.control_hull([(p[0],p[1]) for p in h]) for h in hulls):
+                            raise ValueError('规划轨迹控制包络越过内缩边界')
+                    except (ValueError,TypeError,OverflowError) as e:
+                        self.accepted_trajectory=None;self.fence_violation=str(e);return
+                    self.accepted_trajectory=msg.traj_id
+                    return
                 if self.mission.fence:
                     try:
                         if msg.order!=3 or len(msg.pos_pts)<4:raise ValueError('不支持的规划轨迹结构')
@@ -175,7 +189,10 @@ class Agent:
             points = project_cloud(raw, position[:2],z_min=self.parameters['ground_height'],
                                    z_max=self.parameters['ground_height']+self.parameters['map_size_z'])
         curve = []
-        if traj and traj_age <= 2 and traj[0].order == 3:
+        if traj and traj_age <= 2 and self.diff_planner:
+            try:curve=sample_polynomial(traj[0])
+            except (ValueError,TypeError,OverflowError):pass
+        elif traj and traj_age <= 2 and traj[0].order == 3:
             msg = traj[0]
             curve = sample_bspline([(p.x,p.y,p.z) for p in msg.pos_pts], list(msg.knots))
         return dict(position=position, inflated=points, trajectory=curve,
@@ -261,7 +278,7 @@ class Agent:
         if batt and math.isfinite(batt.percentage) and 0<=batt.percentage<=1:
             battery=round(batt.percentage*100,1)
         if self.parameter_fault:ready=False;reasons.append(self.parameter_fault)
-        return dict(aircraft=self.aircraft,version=VERSION,session_id=self.session_id,connected=bool(state and state.connected),fresh=fresh,
+        return dict(aircraft=self.aircraft,version=VERSION,session_id=self.session_id,rolling_map=self.diff_planner,connected=bool(state and state.connected),fresh=fresh,
                     ready=ready,reasons=reasons,source_age_sec=source_age_sec,bridge_reason=bridge_status.get('reason'),
                     armed=bool(state and state.armed),landed=bool(ext and ext.landed_state==1),
                     mode=state.mode if state else 'UNKNOWN',position=pos,speed=speed,yaw=yaw,battery=battery,
@@ -379,7 +396,7 @@ class Agent:
                     elif p.get('kind')=='local':points.append([p['a'],p['b']])
                     else:raise ValueError('未知航点类型')
                 if command=='prepare':
-                    Mission(self.parameters).start(points,s,now,plan)
+                    Mission(self.parameters,rolling_map=self.diff_planner).start(points,s,now,plan)
                     response=dict(ok=True,status=self.snapshot(),resolved_points=points)
                     self.history[token]=response
                     return response

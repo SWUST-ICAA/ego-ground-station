@@ -6,7 +6,7 @@ import shlex
 import time
 import uuid
 import paramiko
-from onboard.flight_parameters import validate, same
+from onboard.flight_parameters import validate, validate_diff, diff_map_geometry, same
 
 ROOT=Path(__file__).resolve().parents[1]
 CONTAINER='fast-drone-250'
@@ -145,10 +145,10 @@ class Remote:
         self.shell('docker stop -t 10 '+CONTAINER)
         return dict(program=False,connected=False,ready=False,mission=dict(phase='STOPPED'))
 
-    def parameter_files(self, command, values=None):
+    def parameter_files(self, command, values=None, stack=None):
         self.connect()
         destination='/home/'+self.config['user']+'/.fast-drone-ground-station'
-        root='/home/'+self.config['user']+'/Fast-Drone-250'
+        root='/home/'+self.config['user']+('/Diff-Planner' if stack=='diff-planner-px4' else '/Fast-Drone-250')
         self.shell('mkdir -p '+shlex.quote(destination))
         sftp=self.client.open_sftp()
         try:sftp.put(str(ROOT/'onboard/flight_parameters.py'),destination+'/flight_parameters.py')
@@ -160,6 +160,17 @@ class Remote:
     def get_parameters(self):
         state=self.status()
         image_info=json.loads(self.shell("docker inspect -f '{{json .Config.Labels}}' "+CONTAINER)) or {}
+        if image_info.get('fast-drone.stack')=='diff-planner-px4':
+            saved=self.parameter_files('read',stack='diff-planner-px4')['values']
+            supported=True
+            if state.get('program'):
+                result=self.rpc('parameters');values=validate(result['parameters']);supported=result['supported']
+                if not same(saved,values):raise RuntimeError('运行值与保存值不一致，请关闭程序后重新启动')
+            else:
+                values=saved
+            return dict(values=values,program=state.get('program',False),supported=supported,
+                        stack='diff-planner-px4',map_geometry=diff_map_geometry(values),
+                        source='Diff-Planner：运行值已与保存值核对' if state.get('program') else 'Diff-Planner：已保存；下次启动生效')
         supported=image_info.get('fast-drone.flight-parameters')=='1'
         saved=self.parameter_files('read')['values']
         if state.get('program'):
@@ -176,10 +187,11 @@ class Remote:
         values=validate(values)
         before=self.get_parameters()
         if not before['supported']:raise RuntimeError('机上镜像尚未支持参数设置，请先更新此飞机的规划器镜像')
+        if before.get('stack')=='diff-planner-px4':values=validate_diff(values)
         was_running=before['program']
         # stop_program repeats fresh landed/unarmed/inactive checks inside the aircraft.
         if was_running:self.stop_program()
-        saved=self.parameter_files('write',values)
+        saved=self.parameter_files('write',values,stack=before.get('stack'))
         try:
             if was_running:self.start_program()
             actual=self.get_parameters()

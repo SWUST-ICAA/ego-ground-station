@@ -3,6 +3,43 @@ import bisect
 import math
 
 
+def polynomial_hulls(msg):
+    """Exact quintic power-to-Bernstein conversion for conservative fence checks."""
+    durations = list(msg.duration)
+    axes = [list(msg.coef_x), list(msg.coef_y), list(msg.coef_z)]
+    if msg.order != 5 or not 1 <= len(durations) <= 1000:
+        raise ValueError('无效的五次多项式轨迹')
+    if any(len(a) != 6*len(durations) for a in axes):
+        raise ValueError('多项式系数长度不一致')
+    if not all(math.isfinite(t) and 0 < t <= 300 for t in durations):
+        raise ValueError('多项式时间段无效')
+    if not all(math.isfinite(c) for a in axes for c in a):
+        raise ValueError('多项式系数无效')
+    hulls = []
+    for piece, duration in enumerate(durations):
+        powers = [[a[piece*6+5-i]*duration**i for i in range(6)] for a in axes]
+        points = [[sum(powers[axis][i]*math.comb(k,i)/math.comb(5,i) for i in range(k+1))
+                   for axis in range(3)] for k in range(6)]
+        if not all(math.isfinite(v) for p in points for v in p):
+            raise ValueError('多项式包络无效')
+        hulls.append(points)
+    return hulls
+
+
+def sample_polynomial(msg, count=41):
+    hulls = polynomial_hulls(msg)
+    total = sum(msg.duration); result = []
+    for index in range(count):
+        t = total*index/(count-1); piece = 0
+        while piece < len(hulls)-1 and t > msg.duration[piece]:
+            t -= msg.duration[piece]; piece += 1
+        u = min(1.,max(0.,t/msg.duration[piece])); work = hulls[piece]
+        for _ in range(5):
+            work = [[(1-u)*a+u*b for a,b in zip(p,q)] for p,q in zip(work,work[1:])]
+        result.append([round(v,2) for v in work[0]])
+    return result
+
+
 def project_cloud(points, center, radius=8.0, limit=1800, z_min=1.0, z_max=1.4):
     """Project the inflated occupancy cloud throughout the selected map height."""
     cells = {}

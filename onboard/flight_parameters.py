@@ -52,10 +52,67 @@ def same(a, b):
     return set(a)==set(b) and all(math.isclose(a[k],b[k],rel_tol=1e-8,abs_tol=1e-8) for k in a)
 
 
-def map_limits(p):
+def map_limits(p, rolling=False):
     margin=p['obstacles_inflation']+.3
-    x,y=[p['map_size_'+axis]/2-margin for axis in 'xy']
+    # A rolling local map is a sensor window, not a fixed world boundary.
+    extent=DEFAULTS if rolling else p
+    x,y=[extent['map_size_'+axis]/2-margin for axis in 'xy']
     return (-x,x,-y,y)
+
+
+def diff_map_geometry(p):
+    # Match GridMap::initMap, including its resolution adjustment and cell rounding.
+    resolution=max(p['resolution'],p['obstacles_inflation']/4.)
+    half_z=max(2.,p['map_size_z']/2.)
+    cells=[2*math.ceil(v/resolution) for v in (p['map_size_x']/2.,p['map_size_y']/2.,half_z)]
+    inflation=math.ceil((p['obstacles_inflation']-1e-5)/resolution)
+    voxels=math.prod(cells)
+    return dict(resolution=resolution,size=[v*resolution for v in cells],voxels=voxels,
+                buffer_bytes=26*voxels+2*math.prod(v+2*inflation for v in cells))
+
+
+def validate_diff(values):
+    p=validate(values)
+    if math.ceil((p['obstacles_inflation']-1e-5)/p['resolution'])>4:
+        raise ValueError('Diff-Planner 膨胀距离最多为 4 个分辨率单元；当前分辨率至少应为 %.3f m'%(p['obstacles_inflation']/4.))
+    if diff_map_geometry(p)['buffer_bytes']>1_000_000_000:
+        raise ValueError('滚动地图基础缓冲区超过 1 GB，请缩小窗口或增大分辨率')
+    return p
+
+
+def _diff_trees(root):
+    return [ET.parse(Path(root)/'deploy'/name,parser=ET.XMLParser(target=ET.TreeBuilder(insert_comments=True)))
+            for name in ('planner.launch','planner_params.xml')]
+
+
+def _read_diff(root, aircraft):
+    single,advanced=_diff_trees(root)
+    arg=lambda key:float(_element(single,'arg',key).get('value'))
+    p=dict(map_size_x=2*arg('local_map_size_x'),map_size_y=2*arg('local_map_size_y'),
+           map_size_z=arg('virtual_ceil')-arg('virtual_ground'),ground_height=arg('virtual_ground'),
+           obstacles_inflation=arg('inflation_size'),resolution=arg('map_resolution'),
+           max_acc=arg('max_acc'),max_vel=arg('max_vel'),
+           takeoff_height=float(_element(advanced,'param','fsm/waypoint_height').get('value')))
+    if not math.isclose(arg('local_map_size_z'),max(2.,p['map_size_z']/2.)):
+        raise ValueError('滚动地图 Z 窗口与高度范围不一致')
+    saved=Path(root)/'deploy/aircraft'/str(int(aircraft))/'flight_parameters.json'
+    if not same(validate(json.loads(saved.read_text())),p):
+        raise ValueError('保存配置与启动文件不一致，请检查机上配置备份')
+    return validate(p)
+
+
+def _write_diff(root, aircraft, values):
+    p=validate_diff(values);single,advanced=_diff_trees(root)
+    args=dict(local_map_size_x=p['map_size_x']/2.,local_map_size_y=p['map_size_y']/2.,
+              local_map_size_z=max(2.,p['map_size_z']/2.),virtual_ground=p['ground_height'],
+              virtual_ceil=p['ground_height']+p['map_size_z'],inflation_size=p['obstacles_inflation'],
+              map_resolution=p['resolution'],max_acc=p['max_acc'],max_vel=p['max_vel'])
+    for i in range(5):args['point%d_z'%i]=p['takeoff_height']
+    for key,value in args.items():_element(single,'arg',key).set('value',str(value))
+    _element(advanced,'param','fsm/waypoint_height').set('value',str(p['takeoff_height']))
+    _element(advanced,'param','grid_map/visualization_truncate_height').set('value',str(args['virtual_ceil']))
+    paths=[root/'deploy'/name for name in ('planner.launch','planner_params.xml')]
+    return _persist(root,aircraft,p,paths,(single,advanced))
 
 
 def _trees(root):
@@ -72,6 +129,7 @@ def _element(tree, tag, name):
 
 
 def read_files(root, aircraft):
+    if (Path(root)/'deploy/planner.launch').is_file():return _read_diff(root,aircraft)
     single, advanced = _trees(root)
     p = dict(DEFAULTS)
     for key in ('map_size_x','map_size_y','map_size_z','max_acc','max_vel'):
@@ -99,6 +157,7 @@ def _atomic(path, data):
 
 def write_files(root, aircraft, values):
     p=validate(values);root=Path(root)
+    if (root/'deploy/planner.launch').is_file():return _write_diff(root,aircraft,p)
     single,advanced=_trees(root)
     for key in ('map_size_x','map_size_y','map_size_z','max_acc','max_vel'):
         _element(single,'arg',key).set('value',str(p[key]))
@@ -114,8 +173,12 @@ def write_files(root, aircraft, values):
         heights=[ET.SubElement(nodes[0],'param',name='fsm/waypoint_height',type='double')]
     heights[0].set('value',str(p['takeoff_height']))
     paths=[root/LAUNCH_DIR/name for name in ('single_run_in_exp.launch','advanced_param_exp.xml')]
+    return _persist(root,aircraft,p,paths,(single,advanced))
+
+
+def _persist(root,aircraft,p,paths,trees):
     paths.append(root/'deploy/aircraft'/str(int(aircraft))/'flight_parameters.json')
-    data=[ET.tostring(t.getroot(),encoding='utf-8')+b'\n' for t in (single,advanced)]
+    data=[ET.tostring(t.getroot(),encoding='utf-8')+b'\n' for t in trees]
     data.append((json.dumps(p,indent=2,allow_nan=False)+'\n').encode())
     backup=root/'deploy/parameter-backups'/(time.strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex[:8])
     originals=[path.read_bytes() if path.exists() else None for path in paths]
@@ -134,6 +197,23 @@ def write_files(root, aircraft, values):
 
 
 def runtime_parameters(rospy):
+    if rospy.get_param('/navigation_stack','') == 'diff-planner-px4':
+        get=lambda name:float(rospy.get_param(NAMESPACE+name))
+        floor=get('grid_map/virtual_ground')
+        p=validate(dict(map_size_x=2*get('grid_map/local_update_range_x'),
+                             map_size_y=2*get('grid_map/local_update_range_y'),
+                             map_size_z=get('grid_map/virtual_ceil')-floor,
+                             ground_height=floor,
+                             obstacles_inflation=get('grid_map/obstacles_inflation'),
+                             resolution=get('grid_map/resolution'),
+                             max_acc=get('manager/max_acc'),max_vel=get('manager/max_vel'),
+                             takeoff_height=get('fsm/waypoint_height')))
+        for quantity in ('max_acc','max_vel'):
+            if not math.isclose(p[quantity],get('optimization/'+quantity)):
+                raise ValueError('规划器速度/加速度参数不一致：'+quantity)
+        if not math.isclose(get('grid_map/local_update_range_z'),max(2.,p['map_size_z']/2.)):
+            raise ValueError('滚动地图 Z 窗口与高度范围不一致')
+        return p
     p=validate({k:rospy.get_param(NAMESPACE+v,DEFAULTS[k]) for k,v in ROS_KEYS.items()})
     for quantity,other in (('max_vel','optimization/max_vel'),('max_vel','bspline/limit_vel'),
                            ('max_acc','optimization/max_acc'),('max_acc','bspline/limit_acc')):

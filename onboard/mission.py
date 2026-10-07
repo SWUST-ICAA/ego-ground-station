@@ -11,11 +11,11 @@ TERMINAL = {'IDLE', 'COMPLETE', 'ERROR', 'MANUAL'}
 
 
 class Mission:
-    def __init__(self, parameters=None):
+    def __init__(self, parameters=None, rolling_map=False):
         self.parameters = validate(DEFAULTS if parameters is None else parameters)
         self.flight_height = self.parameters["takeoff_height"]
-        margin = self.parameters["obstacles_inflation"] + .3
-        self.bounds = [self.parameters["map_size_"+axis]/2-margin for axis in "xy"]
+        self.map_limits = map_limits(self.parameters, rolling_map)
+        self.bounds = [self.map_limits[1],self.map_limits[3]]
         self.phase = 'IDLE'
         self.reason = ''
         self.points = []
@@ -69,7 +69,7 @@ class Mission:
                 if yaw is None or abs(math.atan2(math.sin(yaw-values[2]),math.cos(yaw-values[2])))>.05:
                     raise ValueError('机头方向已变化，请重新搜索航线')
             if plan.get('mode') not in {'test','competition'}:raise ValueError('围栏模式无效')
-            fence=Fence(plan['polygon'],plan['margin'],map_limits(self.parameters))
+            fence=Fence(plan['polygon'],plan['margin'],self.map_limits)
             if math.dist(pos[:2],xy(plan['origin']))>.3:raise ValueError('起点已变化，请重新搜索航线')
             last=pos[:2]
             for point in validated:
