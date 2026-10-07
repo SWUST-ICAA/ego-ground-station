@@ -24,7 +24,7 @@ def voxel_count(p):
     return math.prod(math.ceil(p['map_size_'+axis]/p['resolution']) for axis in 'xyz')
 
 
-def validate(values):
+def validate(values, max_inflation_cells=10):
     if not isinstance(values, dict) or set(values) != set(DEFAULTS):
         raise ValueError('必须提供完整的 9 项参数')
     p = {}
@@ -35,8 +35,8 @@ def validate(values):
     for key in set(DEFAULTS)-{'ground_height'}:
         if p[key] <= 0: raise ValueError('参数必须大于 0：'+key)
     if p['resolution'] < .02: raise ValueError('地图分辨率不得小于 0.02 m')
-    if math.ceil(p['obstacles_inflation']/p['resolution']) > 10:
-        raise ValueError('膨胀距离最多为 10 个分辨率单元，请减小膨胀距离或增大分辨率')
+    if math.ceil((p['obstacles_inflation']-1e-5)/p['resolution']) > max_inflation_cells:
+        raise ValueError('膨胀距离最多为 %d 个分辨率单元，请减小膨胀距离或增大分辨率'%max_inflation_cells)
     if min(p['map_size_x'],p['map_size_y']) <= 2*(p['obstacles_inflation']+.3):
         raise ValueError('地图 XY 尺寸必须大于两侧膨胀距离及边界余量')
     if p['map_size_z'] < 2*p['resolution']-1e-8:
@@ -61,20 +61,18 @@ def map_limits(p, rolling=False):
 
 
 def diff_map_geometry(p):
-    # Match GridMap::initMap, including its resolution adjustment and cell rounding.
-    resolution=max(p['resolution'],p['obstacles_inflation']/4.)
+    # Match the fine-resolution GridMap without silently enlarging resolution.
+    resolution=p['resolution']
     half_z=max(2.,p['map_size_z']/2.)
     cells=[2*math.ceil(v/resolution) for v in (p['map_size_x']/2.,p['map_size_y']/2.,half_z)]
     inflation=math.ceil((p['obstacles_inflation']-1e-5)/resolution)
     voxels=math.prod(cells)
     return dict(resolution=resolution,size=[v*resolution for v in cells],voxels=voxels,
-                buffer_bytes=26*voxels+2*math.prod(v+2*inflation for v in cells))
+                buffer_bytes=26*voxels+4*math.prod(v+2*inflation for v in cells))
 
 
 def validate_diff(values):
-    p=validate(values)
-    if math.ceil((p['obstacles_inflation']-1e-5)/p['resolution'])>4:
-        raise ValueError('Diff-Planner 膨胀距离最多为 4 个分辨率单元；当前分辨率至少应为 %.3f m'%(p['obstacles_inflation']/4.))
+    p=validate(values,max_inflation_cells=32)
     if diff_map_geometry(p)['buffer_bytes']>1_000_000_000:
         raise ValueError('滚动地图基础缓冲区超过 1 GB，请缩小窗口或增大分辨率')
     return p
@@ -96,9 +94,9 @@ def _read_diff(root, aircraft):
     if not math.isclose(arg('local_map_size_z'),max(2.,p['map_size_z']/2.)):
         raise ValueError('滚动地图 Z 窗口与高度范围不一致')
     saved=Path(root)/'deploy/aircraft'/str(int(aircraft))/'flight_parameters.json'
-    if not same(validate(json.loads(saved.read_text())),p):
+    if not same(validate_diff(json.loads(saved.read_text())),p):
         raise ValueError('保存配置与启动文件不一致，请检查机上配置备份')
-    return validate(p)
+    return validate_diff(p)
 
 
 def _write_diff(root, aircraft, values):
@@ -156,8 +154,9 @@ def _atomic(path, data):
 
 
 def write_files(root, aircraft, values):
-    p=validate(values);root=Path(root)
-    if (root/'deploy/planner.launch').is_file():return _write_diff(root,aircraft,p)
+    root=Path(root)
+    if (root/'deploy/planner.launch').is_file():return _write_diff(root,aircraft,values)
+    p=validate(values)
     single,advanced=_trees(root)
     for key in ('map_size_x','map_size_y','map_size_z','max_acc','max_vel'):
         _element(single,'arg',key).set('value',str(p[key]))
@@ -200,7 +199,7 @@ def runtime_parameters(rospy):
     if rospy.get_param('/navigation_stack','') == 'diff-planner-px4':
         get=lambda name:float(rospy.get_param(NAMESPACE+name))
         floor=get('grid_map/virtual_ground')
-        p=validate(dict(map_size_x=2*get('grid_map/local_update_range_x'),
+        p=validate_diff(dict(map_size_x=2*get('grid_map/local_update_range_x'),
                              map_size_y=2*get('grid_map/local_update_range_y'),
                              map_size_z=get('grid_map/virtual_ceil')-floor,
                              ground_height=floor,
@@ -208,6 +207,10 @@ def runtime_parameters(rospy):
                              resolution=get('grid_map/resolution'),
                              max_acc=get('manager/max_acc'),max_vel=get('manager/max_vel'),
                              takeoff_height=get('fsm/waypoint_height')))
+        if rospy.get_param(NAMESPACE+'grid_map/fine_resolution_version',0)!=1:
+            raise ValueError('规划器镜像尚未支持真实细分辨率，请更新镜像')
+        if not math.isclose(p['resolution'],get('grid_map/actual_resolution')):
+            raise ValueError('规划器实际分辨率与配置不一致')
         for quantity in ('max_acc','max_vel'):
             if not math.isclose(p[quantity],get('optimization/'+quantity)):
                 raise ValueError('规划器速度/加速度参数不一致：'+quantity)

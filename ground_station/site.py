@@ -2,7 +2,7 @@
 import copy
 import math
 from onboard.fence import Fence
-from onboard.flight_parameters import DEFAULTS, map_limits, validate
+from onboard.flight_parameters import DEFAULTS, map_limits, validate, validate_diff
 from onboard.geo import to_local
 from .frame import reference, to_map
 
@@ -28,7 +28,8 @@ def build_plan(profile,targets,state):
         polygon=[to_local(lat,lon,anchor) for lat,lon in COMPETITION]
     elif profile['mode']=='test':polygon=[to_map(p,frame) for p in profile['polygon']]
     else:raise ValueError('未知场地模式')
-    limits=map_limits(validate(state.get('flight_parameters',DEFAULTS)),state.get('rolling_map',False))
+    rolling=state.get('rolling_map',False)
+    limits=map_limits((validate_diff if rolling else validate)(state.get('flight_parameters',DEFAULTS)),rolling)
     if profile['mode']=='competition' and any(not (limits[0]<p[0]<limits[1] and limits[2]<p[1]<limits[3]) for p in polygon):
         raise ValueError('场地转换后超出当前地图，请检查地图尺寸、本机原点和坐标参考')
     fence=Fence(polygon,profile['margin'],limits);start=list(state['position'][:2]);last=start;points=[]

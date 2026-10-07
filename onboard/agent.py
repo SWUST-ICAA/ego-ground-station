@@ -14,8 +14,8 @@ import threading
 import time
 from geo import to_local
 from mission import Mission
-from visualization import project_cloud, sample_bspline, polynomial_hulls, sample_polynomial
-from flight_parameters import NAMESPACE, ROS_KEYS, runtime_parameters, same, validate
+from visualization import project_cloud, sample_bspline, polynomial_hulls, sample_polynomial, pack_voxels
+from flight_parameters import NAMESPACE, ROS_KEYS, runtime_parameters, same, validate, validate_diff
 from pathlib import Path
 
 SOCKET = '/tmp/fast-drone-ground-station.sock'
@@ -28,11 +28,12 @@ def request(payload):
         client.connect(SOCKET)
         client.sendall(json.dumps(payload, allow_nan=False).encode()+b'\n')
         data = b''
-        while not data.endswith(b'\n') and len(data) < 262144:
+        while not data.endswith(b'\n'):
             chunk = client.recv(16384)
             if not chunk:
                 break
             data += chunk
+            if len(data)>2097152:raise ValueError('观察响应超过 2 MB 上限')
         return json.loads(data)
 
 
@@ -71,7 +72,7 @@ class Agent:
         self.parameter_fault = ''
         if saved.exists():
             try:
-                if not same(validate(json.loads(saved.read_text())),self.parameters):
+                if not same((validate_diff if self.diff_planner else validate)(json.loads(saved.read_text())),self.parameters):
                     raise ValueError('启动参数与保存配置不一致')
                 if not self.diff_planner and rospy.get_param(NAMESPACE+'fsm/parameter_control_version',0)!=1:
                     raise ValueError('规划器镜像尚未支持可配置航点高度')
@@ -88,6 +89,7 @@ class Agent:
         self.controller_log = None
         self.stopping = False
         self.visual_sub = None
+        self.visual_base_sub = None
         self.visual_last_request = 0.0
         self.goal = rospy.Publisher('/move_base_simple/goal', PoseStamped, queue_size=1)
         self.command_pub = rospy.Publisher('/ground_station/position_cmd', PositionCommand, queue_size=1)
@@ -173,7 +175,12 @@ class Agent:
                 self.visual_sub = self.rospy.Subscriber(
                     '/drone_0_ego_planner_node/grid_map/occupancy_inflate', PointCloud2,
                     lambda msg:self.store('inflated_map', msg), queue_size=1)
+                self.visual_base_sub = self.rospy.Subscriber(
+                    '/drone_0_ego_planner_node/grid_map/occupancy', PointCloud2,
+                    lambda msg:self.store('occupancy_map',msg),queue_size=1)
             cloud = self.data.get('inflated_map')
+            occupancy = self.data.get('occupancy_map')
+            lidar = self.data.get('cloud')
             traj = self.data.get('traj')
             odom = self.data.get('odom')
         position = None
@@ -181,13 +188,53 @@ class Agent:
             p = odom[0].pose.pose.position
             if all(math.isfinite(v) for v in (p.x,p.y,p.z)):
                 position = [p.x,p.y,p.z]
-        map_age = round(now-cloud[1], 2) if cloud else None
+        def source_age(entry):
+            if not entry:return None
+            stamp=entry[0].header.stamp.to_sec()
+            # Legacy EGO map messages have no stamp: require a fresh source cloud.
+            if stamp<=0 and not self.diff_planner:
+                if not lidar:return None
+                stamp=lidar[0].header.stamp.to_sec()
+                receipt_age=max(now-entry[1],now-lidar[1])
+            else:receipt_age=now-entry[1]
+            delta=self.rospy.Time.now().to_sec()-stamp
+            return round(max(receipt_age,delta),2) if stamp>0 and delta>=-.2 else None
+        map_age = source_age(cloud)
+        lidar_age = round(now-lidar[1], 2) if lidar else None
+        if lidar:
+            stamp=lidar[0].header.stamp.to_sec()
+            ros_age=self.rospy.Time.now().to_sec()-stamp
+            lidar_age=round(max(now-lidar[1],ros_age),2) if stamp>0 and ros_age>=-.2 else None
         traj_age = round(now-traj[1], 2) if traj else None
         points = []
-        if position and cloud and map_age <= 2:
+        lidar_points = []
+        voxel_layers={}
+        if position:
+            import numpy as np
+            for key,entry in [('voxel_inflated',cloud),('voxel_map',occupancy)]:
+                age=source_age(entry)
+                if age is None or age>2:continue
+                msg=entry[0]
+                try:
+                    fields={f.name:f for f in msg.fields}
+                    if any(fields[k].datatype!=7 for k in ('x','y','z')):raise ValueError('点云XYZ类型不是float32')
+                    dtype=np.dtype(dict(names=['x','y','z'],formats=[('>' if msg.is_bigendian else '<')+'f4']*3,
+                                        offsets=[fields[k].offset for k in ('x','y','z')],itemsize=msg.point_step))
+                    xyz=np.ndarray((msg.height,msg.width),dtype=dtype,buffer=msg.data,strides=(msg.row_step,msg.point_step))
+                    xyz=np.stack([xyz[k] for k in ('x','y','z')],axis=-1).reshape(-1,3)
+                    packet=pack_voxels(xyz,self.parameters['resolution'],position[:2],
+                                       self.parameters['ground_height'],self.parameters['ground_height']+self.parameters['map_size_z'])
+                    packet.update(age_sec=age,frame=msg.header.frame_id)
+                    voxel_layers[key]=packet
+                except (ValueError,KeyError,TypeError) as e:voxel_layers[key+'_error']=str(e)
+        if not self.diff_planner and position and cloud and map_age is not None and map_age <= 2:
             raw = point_cloud2.read_points(cloud[0], field_names=('x','y','z'), skip_nans=True)
             points = project_cloud(raw, position[:2],z_min=self.parameters['ground_height'],
                                    z_max=self.parameters['ground_height']+self.parameters['map_size_z'])
+        if position and lidar and lidar_age is not None and lidar_age <= 2:
+            raw = point_cloud2.read_points(lidar[0], field_names=('x','y','z'), skip_nans=True)
+            lidar_points = project_cloud(raw, position[:2],z_min=self.parameters['ground_height']-1.,
+                                         z_max=self.parameters['ground_height']+self.parameters['map_size_z']+1.)
         curve = []
         if traj and traj_age <= 2 and self.diff_planner:
             try:curve=sample_polynomial(traj[0])
@@ -195,7 +242,13 @@ class Agent:
         elif traj and traj_age <= 2 and traj[0].order == 3:
             msg = traj[0]
             curve = sample_bspline([(p.x,p.y,p.z) for p in msg.pos_pts], list(msg.knots))
-        return dict(position=position, inflated=points, trajectory=curve,
+        return dict(position=position, inflated=points, trajectory=curve,**voxel_layers,
+                    resolution=self.parameters['resolution'],
+                    cloud=lidar_points,cloud_age_sec=lidar_age,
+                    cloud_frame=lidar[0].header.frame_id if lidar else None,
+                    ground_height=self.parameters['ground_height'],
+                    ceiling_height=self.parameters['ground_height']+self.parameters['map_size_z'],
+                    target_height=self.parameters['takeoff_height'],
                     map_age_sec=map_age, traj_age_sec=traj_age,
                     map_frame=cloud[0].header.frame_id if cloud else None,
                     source_points=cloud[0].width*cloud[0].height if cloud else 0)
@@ -428,7 +481,9 @@ class Agent:
             with self.data_lock:
                 if self.visual_sub is not None and now-self.visual_last_request>5:
                     self.visual_sub.unregister();self.visual_sub=None
+                    if self.visual_base_sub is not None:self.visual_base_sub.unregister();self.visual_base_sub=None
                     self.data.pop('inflated_map',None)
+                    self.data.pop('occupancy_map',None)
             if now-last_nodes>1:
                 try:
                     graph=rosgraph.Master('/ground_station_agent').getSystemState()

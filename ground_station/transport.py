@@ -20,13 +20,14 @@ class RemoteStream:
         self.channel=channel;self.buffer=b''
 
     def poll(self):
+        replies=[]
         while self.channel.recv_ready():
             self.buffer+=self.channel.recv(65536)
-            if len(self.buffer)>1048576:raise RuntimeError('遥测数据帧过大')
-        replies=[]
-        while b'\n' in self.buffer:
-            line,self.buffer=self.buffer.split(b'\n',1)
-            if line:replies.append(json.loads(line))
+            while b'\n' in self.buffer:
+                line,self.buffer=self.buffer.split(b'\n',1)
+                if len(line)>2097152:raise RuntimeError('遥测数据帧过大')
+                if line:replies.append(json.loads(line))
+            if len(self.buffer)>2097152:raise RuntimeError('遥测数据帧过大')
         if not replies and self.channel.exit_status_ready():
             err=b''
             while self.channel.recv_stderr_ready():err+=self.channel.recv_stderr(4096)
@@ -132,12 +133,15 @@ class Remote:
         self.shell('docker exec '+CONTAINER+' mkdir -p /tmp/ground_station')
         for name in ('agent.py','mission.py','geo.py','fence.py','visualization.py','flight_parameters.py'):
             self.shell('docker cp '+shlex.quote(destination+'/'+name)+' '+CONTAINER+':/tmp/ground_station/'+name)
-        self.shell('docker exec -d '+CONTAINER+' '+ENTRY+' python3 '+AGENT+' serve --aircraft '+str(int(self.config['id'])))
+        launch='exec python3 '+AGENT+' serve --aircraft '+str(int(self.config['id']))+' > /tmp/ground_station/agent.log 2>&1'
+        self.shell('docker exec -d '+CONTAINER+' '+ENTRY+' bash -c '+shlex.quote(launch))
         for attempt in range(40):
             time.sleep(.4)
             try:return self.rpc('status')['status']
             except Exception:
-                if attempt==39:raise
+                if attempt==39:
+                    detail=self.shell('docker exec '+CONTAINER+' tail -n 12 /tmp/ground_station/agent.log').strip()
+                    raise RuntimeError('机载代理启动失败：'+(detail or '请检查机上 ROS 启动日志'))
 
     def stop_program(self):
         # Container shutdown never bypasses the onboard, fresh landed/unarmed check.
@@ -164,7 +168,7 @@ class Remote:
             saved=self.parameter_files('read',stack='diff-planner-px4')['values']
             supported=True
             if state.get('program'):
-                result=self.rpc('parameters');values=validate(result['parameters']);supported=result['supported']
+                result=self.rpc('parameters');values=validate_diff(result['parameters']);supported=result['supported']
                 if not same(saved,values):raise RuntimeError('运行值与保存值不一致，请关闭程序后重新启动')
             else:
                 values=saved
@@ -184,8 +188,8 @@ class Remote:
                     source='运行值已与保存值核对' if state.get('program') else '已保存；下次启动生效')
 
     def apply_parameters(self, values):
-        values=validate(values)
         before=self.get_parameters()
+        values=(validate_diff if before.get('stack')=='diff-planner-px4' else validate)(values)
         if not before['supported']:raise RuntimeError('机上镜像尚未支持参数设置，请先更新此飞机的规划器镜像')
         if before.get('stack')=='diff-planner-px4':values=validate_diff(values)
         was_running=before['program']

@@ -1,2 +1,4 @@
 PyQt5>=5.15,<6
 paramiko>=2.12,<5
+numpy>=1.18
+PyOpenGL>=3.1

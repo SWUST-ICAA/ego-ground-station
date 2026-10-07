@@ -2,17 +2,17 @@
 import math
 try:
     from .fence import Fence, xy
-    from .flight_parameters import DEFAULTS, validate, map_limits
+    from .flight_parameters import DEFAULTS, validate, validate_diff, map_limits
 except ImportError:
     from fence import Fence, xy
-    from flight_parameters import DEFAULTS, validate, map_limits
+    from flight_parameters import DEFAULTS, validate, validate_diff, map_limits
 
 TERMINAL = {'IDLE', 'COMPLETE', 'ERROR', 'MANUAL'}
 
 
 class Mission:
     def __init__(self, parameters=None, rolling_map=False):
-        self.parameters = validate(DEFAULTS if parameters is None else parameters)
+        self.parameters = (validate_diff if rolling_map else validate)(DEFAULTS if parameters is None else parameters)
         self.flight_height = self.parameters["takeoff_height"]
         self.map_limits = map_limits(self.parameters, rolling_map)
         self.bounds = [self.map_limits[1],self.map_limits[3]]
