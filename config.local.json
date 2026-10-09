@@ -2,42 +2,49 @@
   "aircraft": [
     {
       "id": 1,
+      "container": "diff-planner",
       "host": "192.168.11.1",
       "user": "icaa",
       "password": "0"
     },
     {
       "id": 2,
+      "container": "diff-planner",
       "host": "192.168.11.2",
       "user": "icaa01",
       "password": "0"
     },
     {
       "id": 3,
+      "container": "diff-planner",
       "host": "192.168.11.3",
       "user": "pc",
       "password": "123456"
     },
     {
       "id": 4,
+      "container": "diff-planner",
       "host": "192.168.11.4",
       "user": "icaa",
       "password": "0"
     },
     {
       "id": 5,
+      "container": "diff-planner",
       "host": "192.168.11.5",
       "user": "pc",
       "password": "123456"
     },
     {
       "id": 6,
+      "container": "diff-planner",
       "host": "192.168.11.6",
       "user": "icaa",
       "password": "0"
     },
     {
       "id": 7,
+      "container": "diff-planner",
       "host": "192.168.11.7",
       "user": "icaa",
       "password": "0"
