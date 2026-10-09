@@ -228,13 +228,14 @@ def runtime_parameters(rospy):
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('command',choices=['read','write'])
     parser.add_argument('--root',required=True);parser.add_argument('--aircraft',type=int,required=True)
+    parser.add_argument('--container',default='fast-drone-250')
     args=parser.parse_args()
     lock=Path(args.root)/'deploy/.flight-parameters.lock'
     with lock.open('a') as stream:
         fcntl.flock(stream,fcntl.LOCK_EX)
         backup=None
         if args.command=='write':
-            running=subprocess.check_output(['docker','inspect','-f','{{.State.Running}}','fast-drone-250'],text=True).strip()
+            running=subprocess.check_output(['docker','inspect','-f','{{.State.Running}}',args.container],text=True).strip()
             if running!='false':raise ValueError('保存要求先关闭机上程序')
             backup=write_files(args.root,args.aircraft,json.load(sys.stdin))
         print(json.dumps(dict(values=read_files(args.root,args.aircraft),backup=backup),allow_nan=False))

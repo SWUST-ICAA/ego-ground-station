@@ -9,7 +9,6 @@ import paramiko
 from onboard.flight_parameters import validate, validate_diff, diff_map_geometry, same
 
 ROOT=Path(__file__).resolve().parents[1]
-CONTAINER='fast-drone-250'
 ENTRY='/fast_drone_ws/deploy/entrypoint.sh'
 AGENT='/tmp/ground_station/agent.py'
 
@@ -41,6 +40,7 @@ class RemoteStream:
 class Remote:
     def __init__(self, config):
         self.config=config
+        self.container=shlex.quote(config.get('container','fast-drone-250'))
         self.client=None
 
     def close(self):
@@ -76,7 +76,7 @@ class Remote:
         payload=dict(command=command,**params)
         if command not in {'status','observe','parameters'}:payload['id']=uuid.uuid4().hex
         try:
-            out=self.shell('docker exec -i '+CONTAINER+' '+ENTRY+' python3 '+AGENT+' request',json.dumps(payload,allow_nan=False),timeout=25)
+            out=self.shell('docker exec -i '+self.container+' '+ENTRY+' python3 '+AGENT+' request',json.dumps(payload,allow_nan=False),timeout=25)
             result=json.loads(out)
         except Exception as e:
             if command not in {'status','prepare','observe','parameters'}:
@@ -86,7 +86,7 @@ class Remote:
         return result
 
     def status(self):
-        running=self.shell("docker inspect -f '{{.State.Running}}' "+CONTAINER).strip()
+        running=self.shell("docker inspect -f '{{.State.Running}}' "+self.container).strip()
         if running!='true':return dict(program=False,connected=False,ready=False,mission=dict(phase='STOPPED'),reasons=['机上程序已停止'])
         try:
             return dict(self.rpc('status')['status'],program=True)
@@ -99,7 +99,7 @@ class Remote:
         if kind not in {'status','observe'} or not .15<=period<=2.0:
             raise ValueError('无效的数据流参数')
         self.connect()
-        command=('docker exec '+CONTAINER+' '+ENTRY+' python3 -u '+AGENT+
+        command=('docker exec '+self.container+' '+ENTRY+' python3 -u '+AGENT+
                  ' stream --kind '+kind+' --period '+str(period))
         _,out,_=self.client.exec_command(command,timeout=10)
         return RemoteStream(out.channel)
@@ -108,13 +108,13 @@ class Remote:
         return self.rpc('observe')['observation']
 
     def start_program(self):
-        try:running=self.shell("docker inspect -f '{{.State.Running}}' "+CONTAINER).strip()
+        try:running=self.shell("docker inspect -f '{{.State.Running}}' "+self.container).strip()
         except RuntimeError as e:
             if 'No such object' not in str(e):raise
-            directory='/home/'+self.config['user']+'/Fast-Drone-250'
+            directory='/home/'+self.config['user']+('/Diff-Planner' if self.config.get('container')=='diff-planner' else '/Fast-Drone-250')
             self.shell('cd '+shlex.quote(directory)+' && bash deploy/run.sh '+str(int(self.config['id'])))
             running='true'
-        if running!='true':self.shell('docker start '+CONTAINER)
+        if running!='true':self.shell('docker start '+self.container)
         try:
             current=self.rpc('status')['status']
         except Exception as e:
@@ -130,23 +130,23 @@ class Remote:
             for name in ('agent.py','mission.py','geo.py','fence.py','visualization.py','flight_parameters.py'):
                 sftp.put(str(ROOT/'onboard'/name),destination+'/'+name)
         finally:sftp.close()
-        self.shell('docker exec '+CONTAINER+' mkdir -p /tmp/ground_station')
+        self.shell('docker exec '+self.container+' mkdir -p /tmp/ground_station')
         for name in ('agent.py','mission.py','geo.py','fence.py','visualization.py','flight_parameters.py'):
-            self.shell('docker cp '+shlex.quote(destination+'/'+name)+' '+CONTAINER+':/tmp/ground_station/'+name)
+            self.shell('docker cp '+shlex.quote(destination+'/'+name)+' '+self.container+':/tmp/ground_station/'+name)
         launch='exec python3 '+AGENT+' serve --aircraft '+str(int(self.config['id']))+' > /tmp/ground_station/agent.log 2>&1'
-        self.shell('docker exec -d '+CONTAINER+' '+ENTRY+' bash -c '+shlex.quote(launch))
+        self.shell('docker exec -d '+self.container+' '+ENTRY+' bash -c '+shlex.quote(launch))
         for attempt in range(40):
             time.sleep(.4)
             try:return self.rpc('status')['status']
             except Exception:
                 if attempt==39:
-                    detail=self.shell('docker exec '+CONTAINER+' tail -n 12 /tmp/ground_station/agent.log').strip()
+                    detail=self.shell('docker exec '+self.container+' tail -n 12 /tmp/ground_station/agent.log').strip()
                     raise RuntimeError('机载代理启动失败：'+(detail or '请检查机上 ROS 启动日志'))
 
     def stop_program(self):
         # Container shutdown never bypasses the onboard, fresh landed/unarmed check.
         self.rpc('stop')
-        self.shell('docker stop -t 10 '+CONTAINER)
+        self.shell('docker stop -t 10 '+self.container)
         return dict(program=False,connected=False,ready=False,mission=dict(phase='STOPPED'))
 
     def parameter_files(self, command, values=None, stack=None):
@@ -158,12 +158,12 @@ class Remote:
         try:sftp.put(str(ROOT/'onboard/flight_parameters.py'),destination+'/flight_parameters.py')
         finally:sftp.close()
         return json.loads(self.shell('python3 '+shlex.quote(destination+'/flight_parameters.py')+' '+command+
-                                     ' --root '+shlex.quote(root)+' --aircraft '+str(int(self.config['id'])),
+                                     ' --root '+shlex.quote(root)+' --aircraft '+str(int(self.config['id']))+' --container '+self.container,
                                      json.dumps(values,allow_nan=False) if values is not None else None))
 
     def get_parameters(self):
         state=self.status()
-        image_info=json.loads(self.shell("docker inspect -f '{{json .Config.Labels}}' "+CONTAINER)) or {}
+        image_info=json.loads(self.shell("docker inspect -f '{{json .Config.Labels}}' "+self.container)) or {}
         if image_info.get('fast-drone.stack')=='diff-planner-px4':
             saved=self.parameter_files('read',stack='diff-planner-px4')['values']
             supported=True
