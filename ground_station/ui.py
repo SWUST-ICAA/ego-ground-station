@@ -153,9 +153,18 @@ class Window(W.QMainWindow):
             self.table.item(row,2).setText('未连接')
             worker.finished.connect(lambda n=n:self.connection_finished(n))
         status_layout.addWidget(self.table,1);self.update_selection()
-        self.toolbar=W.QWidget();self.toolbar_grid=W.QGridLayout(self.toolbar);self.toolbar_grid.setContentsMargins(0,0,0,0);self.toolbar_grid.setSpacing(8);self.toolbar_columns=0;self.buttons={}
-        for name,label,style in [('start_program','启动选中程序',''),('stop_program','关闭选中程序',''),('start','一键起飞并执行','primary'),('return','选中飞机返航',''),('land','选中飞机就地降落','danger')]:
-            button=W.QPushButton(label);button.setObjectName(style);button.clicked.connect(lambda checked=False,c=name:self.batch(c));self.buttons[name]=button
+        self.toolbar=W.QWidget();toolbar_layout=W.QHBoxLayout(self.toolbar);toolbar_layout.setContentsMargins(0,0,0,0);toolbar_layout.setSpacing(12);self.buttons={}
+        program_layout=W.QVBoxLayout();program_layout.setSpacing(8)
+        btn_start=W.QPushButton('启动选中程序');btn_start.clicked.connect(lambda:self.batch('start_program'));self.buttons['start_program']=btn_start;program_layout.addWidget(btn_start)
+        btn_stop=W.QPushButton('关闭选中程序');btn_stop.clicked.connect(lambda:self.batch('stop_program'));self.buttons['stop_program']=btn_stop;program_layout.addWidget(btn_stop)
+        toolbar_layout.addLayout(program_layout,1)
+        separator=W.QFrame();separator.setFrameShape(W.QFrame.VLine);separator.setStyleSheet('background:#E5E7EB;max-width:1px;');toolbar_layout.addWidget(separator)
+        flight_layout=W.QVBoxLayout();flight_layout.setSpacing(8)
+        btn_takeoff=W.QPushButton('一键起飞并执行');btn_takeoff.setObjectName('primary');btn_takeoff.clicked.connect(lambda:self.batch('start'));self.buttons['start']=btn_takeoff;flight_layout.addWidget(btn_takeoff)
+        bottom_row=W.QHBoxLayout();bottom_row.setSpacing(8)
+        btn_return=W.QPushButton('选中飞机返航');btn_return.clicked.connect(lambda:self.batch('return'));self.buttons['return']=btn_return;bottom_row.addWidget(btn_return)
+        btn_land=W.QPushButton('选中飞机就地降落');btn_land.setObjectName('danger');btn_land.clicked.connect(lambda:self.batch('land'));self.buttons['land']=btn_land;bottom_row.addWidget(btn_land)
+        flight_layout.addLayout(bottom_row);toolbar_layout.addLayout(flight_layout,2)
         status_layout.addWidget(self.toolbar);self.main_splitter.addWidget(status_panel)
         splitter=W.QSplitter();splitter.setChildrenCollapsible(False);self.main_splitter.addWidget(splitter)
         left=W.QWidget();ll=W.QVBoxLayout(left);ll.setContentsMargins(0,0,10,0)
@@ -165,16 +174,15 @@ class Window(W.QMainWindow):
         editor_tabs=W.QTabWidget();ll.addWidget(editor_tabs,1)
         self.site_widget=SiteWidget(config.get('site'));editor_tabs.addTab(self.site_widget,'场地 / 航线')
         self.site_widget.changed.connect(self.site_changed);self.site_widget.search.connect(self.search_routes)
-        self.notice=W.QLabel();self.notice.setWordWrap(True);ll.addWidget(self.notice)
         self.waypoint_editor=WaypointEditor();editor_tabs.insertTab(0,self.waypoint_editor,'目标点');editor_tabs.setCurrentIndex(0)
         self.waypoint_editor.pointsChanged.connect(self.save_points)
         self.waypoint_editor.logMessage.connect(self.write_log)
-        text=W.QLabel('米制：搜索时位置为原点、机头为前，X 向右、Y 向前；飞行中方向固定。经纬度：WGS84。\n移动或转动飞机后请重新搜索航线。最后返回起飞点并降落，高度以机上参数设置为准。');text.setWordWrap(True);text.setObjectName('muted');ll.addWidget(text)
         self.details=W.QLabel('等待遥测');self.details.setWordWrap(True);ll.addWidget(self.details)
         editor=W.QScrollArea();editor.setWidgetResizable(True);editor.setFrameShape(W.QFrame.NoFrame);editor.setWidget(left);editor.setMinimumSize(350,150)
         splitter.addWidget(editor)
-        right=W.QWidget();rl=W.QVBoxLayout(right);rl.setContentsMargins(4,0,0,0)
-        self.view_tabs=W.QTabWidget();rl.addWidget(self.view_tabs,1)
+        right=W.QWidget();rl=W.QHBoxLayout(right);rl.setContentsMargins(4,0,0,0);rl.setSpacing(8)
+        right_main=W.QWidget();right_main_layout=W.QVBoxLayout(right_main);right_main_layout.setContentsMargins(0,0,0,0)
+        self.view_tabs=W.QTabWidget();right_main_layout.addWidget(self.view_tabs,1)
         self.map_panel=MapPanel([a['id'] for a in config['aircraft']]);self.view_tabs.addTab(self.map_panel,'航线总览')
         self.planner_view=PlannerView();self.planner_view.show_aircraft(self.current)
         self.view_tabs.addTab(self.planner_view,'局部规划观察')
@@ -184,13 +192,219 @@ class Window(W.QMainWindow):
         self.parameter_widget.readRequested.connect(lambda:self.parameter_command('get_parameters'))
         self.parameter_widget.applyRequested.connect(lambda values:self.parameter_command('apply_parameters',values))
         self.view_tabs.currentChanged.connect(self.update_observer)
+        rl.addWidget(right_main,3)
+        log_container=W.QWidget();log_layout=W.QVBoxLayout(log_container);log_layout.setContentsMargins(0,0,0,0);log_layout.setSpacing(4)
+        log_label=W.QLabel('日志');log_label.setObjectName('muted');log_layout.addWidget(log_label,0)
+        self.log=W.QPlainTextEdit();self.log.setReadOnly(True);self.log.setMinimumWidth(280);self.log.setMaximumWidth(400);self.log.document().setMaximumBlockCount(300)
+        self.log.setSizePolicy(W.QSizePolicy.Preferred,W.QSizePolicy.Expanding);log_layout.addWidget(self.log,1)
+        log_container.setSizePolicy(W.QSizePolicy.Preferred,W.QSizePolicy.Expanding);rl.addWidget(log_container,1)
         for n,plot in self.map_panel.plots.items():plot.clicked.connect(self.select_aircraft)
         self.table.cellClicked.connect(lambda row,col:self.select_aircraft(self.config['aircraft'][row]['id']) if col else None)
         splitter.addWidget(right);splitter.setStretchFactor(0,0);splitter.setStretchFactor(1,1);splitter.setSizes([460,1060])
-        self.log=W.QPlainTextEdit();self.log.setReadOnly(True);self.log.setMinimumHeight(50);self.log.document().setMaximumBlockCount(300);self.main_splitter.addWidget(self.log)
-        self.main_splitter.setSizes([335,590,90]);self.main_splitter.setStretchFactor(0,1);self.main_splitter.setStretchFactor(1,3);self.main_splitter.setStretchFactor(2,0)
-        self.setStyleSheet('''QMainWindow,QWidget{background:#0b1421;color:#dce7f5;font-family:"Noto Sans CJK SC","DejaVu Sans";font-size:13px} QLabel#title{font-size:21px;font-weight:700} QLabel#badge{color:#39d0ca;background:#142b35;border-radius:6px;padding:9px} QLabel#muted{color:#8297af} QPushButton{background:#1b2a40;border:1px solid #2d425c;border-radius:6px;padding:10px 14px} QPushButton:hover{background:#263b55} QPushButton:disabled{color:#586777;background:#142031} QPushButton#primary{background:#1b938f;color:white;font-weight:bold} QPushButton#danger{background:#69353c;color:#ffdbdf} QTableWidget,QPlainTextEdit{background:#101d2c;alternate-background-color:#152436;border:1px solid #25374b;border-radius:5px;gridline-color:#25374b;selection-background-color:#214e63} QHeaderView::section{background:#17283c;color:#9bb2cc;padding:8px;border:0} QComboBox{background:#1b2a40;padding:6px;border:1px solid #30465f;border-radius:4px} QLineEdit{background:#142236} QCheckBox{spacing:7px} QCheckBox::indicator{width:16px;height:16px} QSplitter::handle{background:#30465f;width:5px;height:5px} QScrollArea{border:0}''')
-        self.adapt_toolbar();self.load_points();self.write_log('模拟演示：2 号机无 GNSS，可用米制航点。' if demo else '启动程序不会解锁；任务在各机独立执行。')
+        self.main_splitter.setSizes([335,590]);self.main_splitter.setStretchFactor(0,1);self.main_splitter.setStretchFactor(1,3)
+        self.setStyleSheet('''
+            QMainWindow, QWidget {
+                background: #F5F7FA;
+                color: #1F2937;
+                font-family: "Times New Roman", "Liberation Serif", "SimSun", "Noto Serif CJK SC", serif;
+                font-size: 13px;
+            }
+
+            QLabel#title {
+                font-size: 21px;
+                font-weight: 700;
+                color: #1F2937;
+            }
+
+            QLabel#badge {
+                color: #1E40AF;
+                background: #EFF6FF;
+                border: 1px solid #BFDBFE;
+                border-radius: 6px;
+                padding: 9px;
+            }
+
+            QLabel#muted {
+                color: #6B7280;
+            }
+
+            QPushButton {
+                background: white;
+                border: 1px solid #D1D5DB;
+                border-radius: 6px;
+                color: #1F2937;
+                padding: 10px 16px;
+                font-weight: 500;
+            }
+
+            QPushButton:hover {
+                background: #F9FAFB;
+                border-color: #9CA3AF;
+            }
+
+            QPushButton:pressed {
+                background: #F3F4F6;
+            }
+
+            QPushButton:disabled {
+                color: #9CA3AF;
+                background: #F9FAFB;
+                border-color: #E5E7EB;
+            }
+
+            QPushButton#primary {
+                background: #2563EB;
+                color: white;
+                font-weight: 700;
+                border: none;
+                padding: 12px 20px;
+            }
+
+            QPushButton#primary:hover {
+                background: #3B82F6;
+            }
+
+            QPushButton#primary:disabled {
+                background: #93C5FD;
+                color: white;
+            }
+
+            QPushButton#danger {
+                background: #DC2626;
+                color: white;
+                font-weight: 600;
+                border: none;
+            }
+
+            QPushButton#danger:hover {
+                background: #EF4444;
+            }
+
+            QPushButton#danger:disabled {
+                background: #FCA5A5;
+                color: white;
+            }
+
+            QTableWidget {
+                background: white;
+                alternate-background-color: #F9FAFB;
+                border: 1px solid #E5E7EB;
+                border-radius: 6px;
+                gridline-color: #E5E7EB;
+                selection-background-color: #DBEAFE;
+                selection-color: #1F2937;
+            }
+
+            QHeaderView::section {
+                background: #F3F4F6;
+                color: #374151;
+                padding: 10px;
+                border: 0;
+                border-bottom: 2px solid #E5E7EB;
+                font-weight: 600;
+            }
+
+            QPlainTextEdit {
+                background: white;
+                border: 1px solid #E5E7EB;
+                border-radius: 6px;
+                padding: 8px;
+                color: #374151;
+                selection-background-color: #BFDBFE;
+                selection-color: #111827;
+            }
+
+            QComboBox {
+                background: white;
+                padding: 6px 10px;
+                border: 1px solid #D1D5DB;
+                border-radius: 4px;
+                color: #1F2937;
+            }
+
+            QComboBox:hover {
+                border-color: #9CA3AF;
+            }
+
+            QComboBox:focus {
+                border-color: #2563EB;
+            }
+
+            QLineEdit {
+                background: white;
+                border: 1px solid #D1D5DB;
+                border-radius: 4px;
+                padding: 6px 10px;
+                color: #1F2937;
+            }
+
+            QLineEdit:focus {
+                border-color: #2563EB;
+            }
+
+            QCheckBox {
+                spacing: 7px;
+                color: #1F2937;
+            }
+
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border: 2px solid #D1D5DB;
+                border-radius: 3px;
+                background: white;
+            }
+
+            QCheckBox::indicator:hover {
+                border-color: #9CA3AF;
+            }
+
+            QCheckBox::indicator:checked {
+                background: #2563EB;
+                border-color: #2563EB;
+            }
+
+            QSplitter::handle {
+                background: #E5E7EB;
+                width: 5px;
+                height: 5px;
+            }
+
+            QSplitter::handle:hover {
+                background: #D1D5DB;
+            }
+
+            QScrollArea {
+                border: 0;
+            }
+
+            QTabWidget::pane {
+                border: 1px solid #E5E7EB;
+                border-radius: 6px;
+                background: white;
+            }
+
+            QTabBar::tab {
+                background: #F9FAFB;
+                color: #6B7280;
+                padding: 8px 16px;
+                border: 1px solid #E5E7EB;
+                border-bottom: none;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }
+
+            QTabBar::tab:selected {
+                background: white;
+                color: #1F2937;
+                font-weight: 600;
+            }
+
+            QTabBar::tab:hover:!selected {
+                background: #F3F4F6;
+            }
+        ''')
+        self.load_points();self.write_log('模拟演示：2 号机无 GNSS，可用米制航点。' if demo else '启动程序不会解锁；任务在各机独立执行。')
         self.write_log('请点击各机的「连接 SSH」；仅连接你需要操作的飞机。')
         self.timer=QtCore.QTimer(self);self.timer.timeout.connect(self.refresh_detail);self.timer.start(200)
 
@@ -214,8 +428,7 @@ class Window(W.QMainWindow):
         self.selection_count.setText(f'已选 {count} / {total} 架')
     def resizeEvent(self,event):
         super().resizeEvent(event)
-        if hasattr(self,'toolbar_grid'):
-            self.adapt_toolbar();QtCore.QTimer.singleShot(0,self.fit_sections)
+        QtCore.QTimer.singleShot(0,self.fit_sections)
     def mark_sections_adjusted(self,*args):self.sections_adjusted=True
     def fit_sections(self):
         if self.sections_adjusted:return
@@ -223,14 +436,6 @@ class Window(W.QMainWindow):
         desired=self.table.rowCount()*44+self.table.horizontalHeader().height()+self.toolbar.sizeHint().height()+self.select_all.sizeHint().height()+16
         top=min(desired,int(height*.48));bottom=min(90,max(50,height//12))
         self.main_splitter.setSizes([top,max(150,height-top-bottom-10),bottom])
-    def adapt_toolbar(self):
-        columns=5 if self.width()>=1150 else 3
-        if columns==self.toolbar_columns:return
-        while self.toolbar_grid.count():self.toolbar_grid.takeAt(0)
-        for col in range(max(columns,self.toolbar_columns)):self.toolbar_grid.setColumnStretch(col,0)
-        for i,button in enumerate(self.buttons.values()):self.toolbar_grid.addWidget(button,i//columns,i%columns)
-        for col in range(columns):self.toolbar_grid.setColumnStretch(col,1)
-        self.toolbar_columns=columns
     def points(self,n):return self.config.setdefault('waypoints',{}).setdefault(str(n),[])
     def persist(self):
         temporary=self.path.with_suffix('.tmp')
@@ -373,7 +578,7 @@ class Window(W.QMainWindow):
         s=self.states.get(self.current,{});fresh=time.monotonic()-self.received.get(self.current,0)<3
         self.parameter_widget.set_status(s,fresh,self.workers[self.current].pending)
         geo=self.geo_available(self.current);self.waypoint_editor.set_status(s,fresh,geo)
-        self.notice.setText('经纬度和米制坐标均可设置。' if geo else '持续检测 GNSS 与坐标参考，可用后自动开放经纬度点；当前可设置米制点。')
+        self.waypoint_editor.set_note('经纬度和米制坐标均可设置。' if geo else '持续检测 GNSS 与坐标参考，可用后自动开放经纬度点；当前可设置米制点。')
         m=s.get('mission',{});gps=s.get('gps');parts=[]
         parts.extend(s.get('reasons',[]))
         if s.get('error'):parts.append(s['error'][-220:])

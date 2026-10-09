@@ -90,7 +90,7 @@ class CloudCanvas(W.QOpenGLWidget):
         except (ValueError,KeyError,TypeError) as e:self.render_error=str(e);self.meshes=[]
         self.update()
 
-    def initializeGL(self):G.glClearColor(.045,.075,.115,1.)
+    def initializeGL(self):G.glClearColor(.95,.97,.98,1.)
 
     def draw_arrays(self,vertices,colors,mode):
         if not len(vertices):return
@@ -111,11 +111,12 @@ class CloudCanvas(W.QOpenGLWidget):
         G.glMultMatrixf(rotation.T.copy())
         position=self.data.get('position');center=position or [0.,0.,0.];G.glTranslatef(*[-v for v in center])
         floor=self.data.get('ground_height',0.)
-        G.glColor3f(.16,.24,.33);G.glLineWidth(1);G.glBegin(G.GL_LINES)
-        for step in range(-8,9,2):
-            for x,y in [(center[0]+step,center[1]-8),(center[0]+step,center[1]+8),
-                        (center[0]-8,center[1]+step),(center[0]+8,center[1]+step)]:G.glVertex3f(x,y,floor)
-        G.glEnd();count=0
+        # Draw grid with higher visibility
+        G.glDisable(G.GL_DEPTH_TEST);G.glColor3f(.35,.4,.48);G.glLineWidth(2.);G.glBegin(G.GL_LINES)
+        for step in range(-20,21,2):
+            for x,y in [(center[0]+step,center[1]-20),(center[0]+step,center[1]+20),
+                        (center[0]-20,center[1]+step),(center[0]+20,center[1]+step)]:G.glVertex3f(x,y,floor)
+        G.glEnd();G.glEnable(G.GL_DEPTH_TEST);count=0
         for mesh in self.meshes:
             age=self.age(mesh['age'])
             if age is None or age>2:continue
@@ -136,9 +137,9 @@ class CloudCanvas(W.QOpenGLWidget):
             path=np.asarray(self.data.get('trajectory',[]),np.float32).reshape(-1,3)
             G.glLineWidth(3.);self.draw_arrays(path,np.tile(np.array([1.,.3,.45],np.float32),(len(path),1)),G.GL_LINE_STRIP)
         if position:
-            G.glPointSize(10.);G.glColor3f(.1,1.,.85);G.glBegin(G.GL_POINTS);G.glVertex3f(*position);G.glEnd()
+            G.glPointSize(10.);G.glColor3f(.15,.53,.91);G.glBegin(G.GL_POINTS);G.glVertex3f(*position);G.glEnd()
             G.glLineWidth(2.);G.glBegin(G.GL_LINES)
-            for axis,color in enumerate([(1.,.3,.3),(.3,1.,.3),(.3,.5,1.)]):
+            for axis,color in enumerate([(.86,.27,.27),(.16,.7,.51),(.37,.59,1.)]):
                 end=list(position);end[axis]+=.8;G.glColor3f(*color);G.glVertex3f(*position);G.glVertex3f(*end)
             G.glEnd()
         G.glDisable(G.GL_DEPTH_TEST)

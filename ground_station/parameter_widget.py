@@ -16,14 +16,18 @@ class ParameterWidget(W.QWidget):
     def __init__(self):
         super().__init__();self.aircraft=None;self.loaded=False;self.supported=False;self.program=False;self.rolling=False
         layout=W.QVBoxLayout(self);layout.setContentsMargins(18,18,18,18)
-        self.title=W.QLabel();layout.addWidget(self.title)
+        title_row=W.QHBoxLayout();title_row.setSpacing(8)
+        self.title=W.QLabel();title_row.addWidget(self.title)
+        self.help_btn=W.QPushButton('?');self.help_btn.setFixedSize(24,24);self.help_btn.setToolTip('点击查看使用说明')
+        self.help_btn.setStyleSheet('QPushButton{background:#2563EB;color:#FFFFFF;border:none;border-radius:12px;padding:0;font-weight:bold;font-size:13px}QPushButton:hover{background:#1D4ED8}')
+        title_row.addWidget(self.help_btn);title_row.addStretch();layout.addLayout(title_row)
         self.info=W.QLabel('请连接飞机后读取参数');self.info.setWordWrap(True);layout.addWidget(self.info)
-        form=W.QFormLayout();self.fields={};self.labels={}
+        form=W.QFormLayout();form.setFieldGrowthPolicy(W.QFormLayout.ExpandingFieldsGrow);form.setLabelAlignment(QtCore.Qt.AlignRight|QtCore.Qt.AlignVCenter);self.fields={};self.labels={}
         for key,label,unit in FIELDS:
             spin=W.QDoubleSpinBox();spin.setDecimals(3);spin.setRange(-10000 if key=='ground_height' else .001,100000)
             spin.setSingleStep(.1 if key!='resolution' else .02);spin.setSuffix(' '+unit)
             spin.valueChanged.connect(self.describe);spin.setEnabled(False);self.fields[key]=spin
-            self.labels[key]=W.QLabel(label);form.addRow(self.labels[key],spin)
+            self.labels[key]=W.QLabel(label);self.labels[key].setWordWrap(True);self.labels[key].setMinimumWidth(140);form.addRow(self.labels[key],spin)
         layout.addLayout(form)
         self.summary=W.QLabel();self.summary.setWordWrap(True);layout.addWidget(self.summary)
         actions=W.QHBoxLayout();self.read_button=W.QPushButton('读取机上参数')
@@ -31,7 +35,8 @@ class ParameterWidget(W.QWidget):
         self.read_button.clicked.connect(self.readRequested.emit);self.apply_button.clicked.connect(self.apply)
         actions.addWidget(self.read_button);actions.addWidget(self.apply_button);layout.addLayout(actions)
         note=W.QLabel('高度使用机载地图坐标。起飞、去程及返航目标使用同一高度。\n保存运行中的参数会重启机上程序；必须已着陆、未解锁且任务结束。修改后请重新搜索航线。')
-        note.setWordWrap(True);note.setObjectName('muted');layout.addWidget(note);layout.addStretch()
+        note.setWordWrap(True);note.setObjectName('muted');note.setVisible(False);layout.addWidget(note);layout.addStretch()
+        self.help_btn.clicked.connect(lambda:note.setVisible(not note.isVisible()))
         self.show_aircraft(None)
 
     def show_aircraft(self,n):
