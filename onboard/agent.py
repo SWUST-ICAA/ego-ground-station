@@ -19,7 +19,7 @@ from flight_parameters import NAMESPACE, ROS_KEYS, runtime_parameters, same, val
 from pathlib import Path
 
 SOCKET = '/tmp/fast-drone-ground-station.sock'
-VERSION = '1.5.0'
+VERSION = '1.6.0'
 
 
 def request(payload):
@@ -46,6 +46,9 @@ class Agent:
         from std_msgs.msg import String, Float64
         from geometry_msgs.msg import PoseStamped
         self.diff_planner = rospy.get_param('/navigation_stack','') == 'diff-planner-px4'
+        self.controller_kind = rospy.get_param('/flight_controller','px4')
+        if self.controller_kind not in {'px4','acados_mpc'} or (self.controller_kind == 'acados_mpc' and not self.diff_planner):
+            raise ValueError('不支持的飞行控制器配置')
         if self.diff_planner:
             from traj_utils.msg import PolyTraj as TrajectoryMessage
         else:
@@ -105,7 +108,29 @@ class Agent:
         rospy.Subscriber('/drone_%d_fastlio/bridge_status'%(aircraft-1), String, lambda m:self.store('bridge',m))
         trajectory_topic = '/drone_0_planning/trajectory' if self.diff_planner else '/drone_0_planning/bspline'
         rospy.Subscriber(trajectory_topic, TrajectoryMessage, self.traj_cb, queue_size=5)
+        if self.controller_kind == 'acados_mpc':
+            self.mpc_trajectory_pub = rospy.Publisher('/ground_station/mpc_trajectory',TrajectoryMessage,queue_size=2,tcp_nodelay=True)
+            self.mpc_lease_pub = rospy.Publisher('/ground_station/mpc_lease',String,queue_size=1,tcp_nodelay=True)
+            rospy.Subscriber('/mpc/status',String,lambda m:self.store('mpc',m),queue_size=1,tcp_nodelay=True)
+            self.mpc_timer = rospy.Timer(rospy.Duration(.1),self.publish_mpc_lease)
         self.log('观测代理已启动；未启动控制器、未解锁')
+
+    def mpc_lease(self, stamp, bridge_ready):
+        # Independent 10 Hz lease remains alive while arm/service calls block.
+        allowed=bool(bridge_ready and not self.stopping and not self.fence_violation
+                     and self.mission.phase in {'ARMING','TAKEOFF','OUTBOUND','RETURNING'}
+                     and self.controller is not None and self.controller.poll() is None)
+        return dict(stamp=stamp,allowed=allowed,phase=self.mission.phase,
+                    goal_stamp=self.goal_stamp if math.isfinite(self.goal_stamp) else None)
+
+    def publish_mpc_lease(self, _event):
+        from std_msgs.msg import String
+        with self.data_lock:
+            pair=self.data.get('bridge')
+            try:ready=bool(pair and time.monotonic()-pair[1]<.5 and json.loads(pair[0].data).get('ready'))
+            except (ValueError,TypeError):ready=False
+            value=self.mpc_lease(self.rospy.Time.now().to_sec(),ready)
+        self.mpc_lease_pub.publish(String(data=json.dumps(value,allow_nan=False)))
 
     def log(self, text):
         self.events.append(dict(time=time.strftime('%H:%M:%S'),text=text))
@@ -133,6 +158,8 @@ class Agent:
                     except (ValueError,TypeError,OverflowError) as e:
                         self.accepted_trajectory=None;self.fence_violation=str(e);return
                     self.accepted_trajectory=msg.traj_id
+                    if self.controller_kind == 'acados_mpc' and self.mission.phase in {'OUTBOUND','RETURNING'}:
+                        self.mpc_trajectory_pub.publish(msg)
                     return
                 if self.mission.fence:
                     try:
@@ -330,6 +357,14 @@ class Agent:
         battery=None
         if batt and math.isfinite(batt.percentage) and 0<=batt.percentage<=1:
             battery=round(batt.percentage*100,1)
+        mpc_status=None
+        if self.controller_kind == 'acados_mpc':
+            try:
+                mpc=get('mpc',.35)
+                mpc_status=json.loads(mpc.data) if mpc else None
+            except (ValueError,TypeError):mpc_status=None
+            if self.controller is not None and self.mission.active and (not mpc_status or not mpc_status.get('ready')):
+                ready=False;reasons.append('MPC 未就绪：'+str((mpc_status or {}).get('reason','状态过期')))
         if self.parameter_fault:ready=False;reasons.append(self.parameter_fault)
         return dict(aircraft=self.aircraft,version=VERSION,session_id=self.session_id,rolling_map=self.diff_planner,connected=bool(state and state.connected),fresh=fresh,
                     ready=ready,reasons=reasons,source_age_sec=source_age_sec,bridge_reason=bridge_status.get('reason'),
@@ -340,6 +375,7 @@ class Agent:
                     command_age=max(0.,now-self.last_forwarded),flight_parameters=dict(self.parameters),
                     gps=gps_info,geo_ready=bool(gps_valid and self.anchor and heading and pos),
                     bridge_ready=bridge_ready,cloud_points=points,controller='/px4_controller' in node_set,
+                    controller_kind=self.controller_kind,mpc=mpc_status,
                     traj_seq=self.traj_seq,mission=self.mission.status(),events=list(self.events),stopping=self.stopping)
 
     def service(self, name, kind, **kwargs):
@@ -361,7 +397,9 @@ class Agent:
             if action=='log':self.log(value)
             elif action=='controller_start':
                 self.controller_log=open('/tmp/ground-station-controller.log','a')
-                self.controller=subprocess.Popen(['rosrun','controller','px4_controller_node','__name:=px4_controller',
+                executable=(['python3','-B','/diff_ws/deploy/mpc/controller_node.py'] if self.controller_kind == 'acados_mpc'
+                            else ['rosrun','controller','px4_controller_node'])
+                self.controller=subprocess.Popen(executable+['__name:=px4_controller',
                      '_position_cmd_topic:=/ground_station/position_cmd',
                      '_takeoff_height:='+str(self.parameters['takeoff_height'])],stdout=self.controller_log,stderr=subprocess.STDOUT,start_new_session=True)
                 time.sleep(2.2)
