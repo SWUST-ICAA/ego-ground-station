@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
+
+# PyOpenGL auto-detects EGL on WSLg (Mesa/D3D12) while Qt opens the window via
+# GLX, so glVertexPointer et al. cannot find a current context and the point
+# cloud silently fails to draw. Prefer the GLX backend on Linux/X11 unless the
+# user has chosen a platform explicitly.
+if sys.platform.startswith('linux') and os.environ.get('DISPLAY') and not os.environ.get('PYOPENGL_PLATFORM'):
+    os.environ['PYOPENGL_PLATFORM'] = 'glx'
+
 from PyQt5 import QtWidgets
 from ground_station.ui import Window
 

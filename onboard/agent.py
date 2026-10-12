@@ -2,6 +2,7 @@
 """SSH-managed ROS1 mission agent. Unix socket only; no network service."""
 import argparse
 import collections
+import copy
 import fcntl
 import json
 import math
@@ -19,7 +20,7 @@ from flight_parameters import NAMESPACE, ROS_KEYS, runtime_parameters, same, val
 from pathlib import Path
 
 SOCKET = '/tmp/fast-drone-ground-station.sock'
-VERSION = '1.6.0'
+VERSION = '1.7.1'
 
 
 def request(payload):
@@ -81,6 +82,17 @@ class Agent:
                     raise ValueError('规划器镜像尚未支持可配置航点高度')
             except Exception as e:self.parameter_fault = str(e)
         self.mission = Mission(self.parameters,rolling_map=self.diff_planner)
+        self.exploration_enabled = bool(self.diff_planner and rospy.get_param('/exit_exploration_enabled',False))
+        self.mission.exploration_enabled = self.exploration_enabled
+        self.accepted_hulls = None
+        self.local_goal = None
+        self.local_goal_since = 0.
+        self.last_reject = 0.
+        self.hold_yaw = None
+        if self.exploration_enabled:
+            if self.controller_kind != 'px4':raise ValueError('此探索适配器要求 PX4 内部控制器')
+            from exploration_session import ExplorationSession
+            self.explorer = ExplorationSession(self.parameters)
         self.history = collections.OrderedDict()
         self.events = collections.deque(maxlen=60)
         self.traj_seq = 0
@@ -113,7 +125,74 @@ class Agent:
             self.mpc_lease_pub = rospy.Publisher('/ground_station/mpc_lease',String,queue_size=1,tcp_nodelay=True)
             rospy.Subscriber('/mpc/status',String,lambda m:self.store('mpc',m),queue_size=1,tcp_nodelay=True)
             self.mpc_timer = rospy.Timer(rospy.Duration(.1),self.publish_mpc_lease)
+        if self.exploration_enabled:
+            from nav_msgs.msg import OccupancyGrid
+            self.exploration_pub = rospy.Publisher('/ground_station/exploration_context',String,queue_size=1)
+            rospy.Subscriber('/exploration/traversability',OccupancyGrid,self.exploration_grid_cb,queue_size=1)
+            rospy.Subscriber('/exploration/proposal',String,self.exploration_proposal_cb,queue_size=1)
+            self.exploration_timer = rospy.Timer(rospy.Duration(.5),self.publish_exploration_context)
         self.log('观测代理已启动；未启动控制器、未解锁')
+
+    def exploration_grid_cb(self,msg):
+        with self.data_lock:self.explorer.update_grid(msg,time.monotonic())
+
+    def exploration_proposal_cb(self,msg):
+        with self.data_lock:
+            try:
+                value=json.loads(msg.data)
+                if not isinstance(value,dict):raise ValueError('探索建议格式无效')
+                self.explorer.update_proposal(value,time.monotonic())
+            except (ValueError,TypeError):self.explorer.proposal=None
+
+    def publish_exploration_context(self,_event):
+        from std_msgs.msg import String
+        with self.data_lock:
+            context=self.explorer.context(self.mission,self.rospy.Time.now().to_sec())
+            if self.stopping:context['active']=False
+        self.exploration_pub.publish(String(data=json.dumps(context,allow_nan=False)))
+
+    def reject_exploration_trajectory(self,reason):
+        self.accepted_trajectory=None;self.accepted_hulls=None;self.local_goal=None
+        now=time.monotonic()
+        if now-self.last_reject>1.:
+            self.explorer.reject_id+=1;self.last_reject=now
+            self.log('探索局部轨迹撤销，保持任务目标：'+reason)
+
+    def exploration_yaw(self,msg):
+        if math.hypot(msg.velocity.x,msg.velocity.y)<.05:
+            yaw=self.snapshot().get('yaw')
+            if yaw is not None and math.isfinite(yaw):
+                msg=copy.deepcopy(msg);msg.yaw=yaw;msg.yaw_dot=0.
+        return msg
+
+    def publish_local_goal(self,value):
+        from geometry_msgs.msg import PoseStamped
+        msg=PoseStamped();msg.header.stamp=self.rospy.Time.now();msg.header.frame_id='map'
+        self.goal_stamp=msg.header.stamp.to_sec();self.accepted_trajectory=None;self.accepted_hulls=None
+        msg.pose.position.x,msg.pose.position.y,msg.pose.position.z=value;msg.pose.orientation.w=1
+        self.local_goal=list(value);self.local_goal_since=time.monotonic()
+        self.goal.publish(msg)
+        self.log('探索局部目标 x=%.2f y=%.2f z=%.2f'%tuple(value))
+
+    def exploration_step(self,state,now):
+        if self.mission.phase not in {'OUTBOUND','RETURNING'}:return
+        with self.data_lock:
+            stamp=self.rospy.Time.now().to_sec()
+            self.explorer.context(self.mission,stamp)
+            if self.accepted_hulls and self.accepted_hulls[3]!=self.explorer.target_id:
+                self.accepted_trajectory=None;self.accepted_hulls=None;self.local_goal=None
+            goal=self.explorer.proposal_goal(self.mission,state.get('position'),stamp,now)
+            if goal is None:
+                self.accepted_trajectory=None;self.accepted_hulls=None;self.local_goal=None
+                return
+            if self.local_goal:
+                if now-self.local_goal_since>3 and now-self.last_forwarded>3:
+                    self.reject_exploration_trajectory('局部规划指令中断');return
+                reached=math.dist(state['position'],self.local_goal)<.4
+                if math.dist(goal,self.local_goal)<.4 and (not reached or self.accepted_trajectory is not None or now-self.local_goal_since<2):return
+                # Do not reset a healthy trajectory for every 2 Hz proposal.
+                if not reached and now-self.local_goal_since<2:return
+            self.publish_local_goal(goal)
 
     def mpc_lease(self, stamp, bridge_ready):
         # Independent 10 Hz lease remains alive while arm/service calls block.
@@ -157,6 +236,15 @@ class Agent:
                             raise ValueError('规划轨迹控制包络越过内缩边界')
                     except (ValueError,TypeError,OverflowError) as e:
                         self.accepted_trajectory=None;self.fence_violation=str(e);return
+                    if self.exploration_enabled:
+                        now=time.monotonic();stamp=self.rospy.Time.now().to_sec()
+                        start=msg.start_time.to_sec()
+                        if (not self.local_goal or not self.explorer.validate_hulls(hulls,list(msg.duration),stamp-start,stamp,now)):
+                            self.reject_exploration_trajectory('轨迹缺少新鲜通行证明');return
+                        stationary=all(math.dist(point,hulls[0][0])<.05 for h in hulls for point in h)
+                        if stationary and math.dist(hulls[0][0],self.local_goal)>.4:
+                            self.reject_exploration_trajectory('紧急悬停轨迹未前往局部目标');return
+                        self.accepted_hulls=(hulls,list(msg.duration),start,self.explorer.target_id)
                     self.accepted_trajectory=msg.traj_id
                     if self.controller_kind == 'acados_mpc' and self.mission.phase in {'OUTBOUND','RETURNING'}:
                         self.mpc_trajectory_pub.publish(msg)
@@ -174,6 +262,16 @@ class Agent:
                 self.accepted_trajectory = msg.traj_id
 
     def cmd_cb(self, msg):
+        if self.exploration_enabled:
+            with self.data_lock:
+                stamp=self.rospy.Time.now().to_sec()
+                self.explorer.context(self.mission,stamp)
+                h=self.accepted_hulls
+                if (not h or h[3]!=self.explorer.target_id or
+                    not self.explorer.validate_hulls(h[0],h[1],stamp-h[2],stamp,time.monotonic())):
+                    if self.accepted_trajectory is not None:self.reject_exploration_trajectory('剩余轨迹通行证明失效')
+                    return
+            msg=self.exploration_yaw(msg)
         # Do not replay a previous mission while taking off for the next one.
         if (self.mission.phase in {"OUTBOUND", "RETURNING"}
                 and self.accepted_trajectory == msg.trajectory_id
@@ -365,17 +463,28 @@ class Agent:
             except (ValueError,TypeError):mpc_status=None
             if self.controller is not None and self.mission.active and (not mpc_status or not mpc_status.get('ready')):
                 ready=False;reasons.append('MPC 未就绪：'+str((mpc_status or {}).get('reason','状态过期')))
+        if self.exploration_enabled:
+            if '/exit_explorer' not in node_set or self.exploration_pub.get_num_connections()==0:
+                ready=False;reasons.append('探索任务上下文未连接')
+            if self.mission.active and self.rospy.Time.now().to_sec()-self.explorer.started>3:
+                pair=self.explorer.proposal
+                value=pair[0] if pair else {}
+                if (not pair or now-pair[1]>2 or not value.get('ready') or
+                    value.get('session')!=self.explorer.session):
+                    ready=False;reasons.append('探索工作节点未就绪：'+str(value.get('reason','状态过期')))
         if self.parameter_fault:ready=False;reasons.append(self.parameter_fault)
         return dict(aircraft=self.aircraft,version=VERSION,session_id=self.session_id,rolling_map=self.diff_planner,connected=bool(state and state.connected),fresh=fresh,
                     ready=ready,reasons=reasons,source_age_sec=source_age_sec,bridge_reason=bridge_status.get('reason'),
                     armed=bool(state and state.armed),landed=bool(ext and ext.landed_state==1),
                     mode=state.mode if state else 'UNKNOWN',position=pos,speed=speed,yaw=yaw,battery=battery,
                     voltage=batt.voltage if batt and math.isfinite(batt.voltage) else None,
-                    capabilities=['fence-v1','flight-v2','planner-view-v1','telemetry-stream-v1','flight-parameters-v1'],geo_anchor=dict(self.anchor) if self.anchor else None,velocity=velocity,
+                    capabilities=['fence-v1','flight-v2','planner-view-v1','telemetry-stream-v1','flight-parameters-v1','exploration-context-v1'],geo_anchor=dict(self.anchor) if self.anchor else None,velocity=velocity,
                     command_age=max(0.,now-self.last_forwarded),flight_parameters=dict(self.parameters),
                     gps=gps_info,geo_ready=bool(gps_valid and self.anchor and heading and pos),
                     bridge_ready=bridge_ready,cloud_points=points,controller='/px4_controller' in node_set,
                     controller_kind=self.controller_kind,mpc=mpc_status,
+                    exploration_enabled=self.exploration_enabled,
+                    exploration=self.explorer.proposal[0] if self.exploration_enabled and self.explorer.proposal else None,
                     traj_seq=self.traj_seq,mission=self.mission.status(),events=list(self.events),stopping=self.stopping)
 
     def service(self, name, kind, **kwargs):
@@ -422,6 +531,9 @@ class Agent:
                 if not self.service('/mavros/cmd/arming',CommandBool,value=True).success:
                     raise RuntimeError('飞控拒绝解锁')
             elif action=='goal':
+                if self.exploration_enabled:
+                    self.local_goal=None;self.accepted_trajectory=None;self.accepted_hulls=None
+                    self.goal_stamp=float('inf');continue
                 msg=PoseStamped();msg.header.stamp=self.rospy.Time.now();msg.header.frame_id='map'
                 self.goal_stamp=msg.header.stamp.to_sec();self.accepted_trajectory=None
                 self.last_forwarded=time.monotonic()
@@ -444,10 +556,10 @@ class Agent:
         self.log(str(exc))
         s=self.snapshot()
         if s['fresh'] and not s['armed']:
-            self.mission.transition('ERROR',time.monotonic(),str(exc))
+            with self.data_lock:self.mission.transition('ERROR',time.monotonic(),str(exc))
             self.perform([('controller_stop',None)])
         else:
-            self.mission.transition('LAND_REQUESTED',time.monotonic(),str(exc))
+            with self.data_lock:self.mission.transition('LAND_REQUESTED',time.monotonic(),str(exc))
             try:self.perform([('land',None)])
             except Exception as e:self.log('降落请求异常：'+str(e))
 
@@ -487,14 +599,23 @@ class Agent:
                     elif p.get('kind')=='local':points.append([p['a'],p['b']])
                     else:raise ValueError('未知航点类型')
                 if command=='prepare':
-                    Mission(self.parameters,rolling_map=self.diff_planner).start(points,s,now,plan)
+                    candidate=Mission(self.parameters,rolling_map=self.diff_planner)
+                    candidate.exploration_enabled=self.exploration_enabled
+                    candidate.start(points,s,now,plan)
                     response=dict(ok=True,status=self.snapshot(),resolved_points=points)
                     self.history[token]=response
                     return response
-                actions=self.mission.start(points,s,now,plan)
+                with self.data_lock:actions=self.mission.start(points,s,now,plan)
+                if self.exploration_enabled:
+                    with self.data_lock:
+                        self.explorer.reset(self.session_id+':'+token,self.rospy.Time.now().to_sec())
+                        self.local_goal=None;self.accepted_trajectory=None;self.accepted_hulls=None
+                        self.goal_stamp=float('inf')
                 self.fence_violation=None
-            elif command=='return':actions=self.mission.return_home(s,now)
-            elif command=='land':actions=self.mission.land(s,now)
+            elif command=='return':
+                with self.data_lock:actions=self.mission.return_home(s,now)
+            elif command=='land':
+                with self.data_lock:actions=self.mission.land(s,now)
             elif command=='stop':
                 if not s['fresh'] or s['armed'] or not s['landed'] or self.mission.active:
                     raise ValueError('关闭要求新鲜的已着陆、未解锁状态且没有执行中的任务')
@@ -510,6 +631,11 @@ class Agent:
             self.history[token]=response
             while len(self.history)>200:self.history.popitem(last=False)
             return response
+
+    def tick_mission(self,state,now):
+        # Context timer and command callbacks must not observe half a route transition.
+        with self.data_lock:actions=self.mission.tick(state,now)
+        self.perform(actions)
 
     def run(self):
         import rosgraph
@@ -535,9 +661,14 @@ class Agent:
                     if self.fence_violation and self.mission.phase in {'TAKEOFF','OUTBOUND','RETURNING'}:
                         fault=self.fence_violation;self.fence_violation=None
                         state=self.snapshot()
-                        if state.get('mode')=='OFFBOARD':self.perform(self.mission.land(state,now,fault))
-                        else:self.perform(self.mission.tick(state,now))
-                    else:self.perform(self.mission.tick(self.snapshot(),now))
+                        if state.get('mode')=='OFFBOARD':
+                            with self.data_lock:actions=self.mission.land(state,now,fault)
+                            self.perform(actions)
+                        else:self.tick_mission(state,now)
+                    else:
+                        state=self.snapshot()
+                        if self.exploration_enabled and state['ready']:self.exploration_step(state,now)
+                        self.tick_mission(state,now)
                 except Exception as e:self.failure(e)
                 if before!=self.mission.phase:self.log('任务状态：'+self.mission.phase+' '+self.mission.reason)
             time.sleep(.1)

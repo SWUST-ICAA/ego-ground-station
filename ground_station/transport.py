@@ -90,8 +90,8 @@ class Remote:
         if running!='true':return dict(program=False,connected=False,ready=False,mission=dict(phase='STOPPED'),reasons=['机上程序已停止'])
         try:
             return dict(self.rpc('status')['status'],program=True)
-        except RuntimeError as e:
-            if 'No such file' in str(e) or 'Connection refused' in str(e):
+        except (RuntimeError,json.JSONDecodeError) as e:
+            if isinstance(e,json.JSONDecodeError) or 'No such file' in str(e) or 'Connection refused' in str(e):
                 return dict(program=True,connected=False,ready=False,mission=dict(phase='NO_AGENT'),reasons=['点击启动程序以加载观测代理'])
             raise
 
@@ -117,21 +117,23 @@ class Remote:
         if running!='true':self.shell('docker start '+self.container)
         try:
             current=self.rpc('status')['status']
-        except Exception as e:
-            if not any(t in str(e) for t in ['No such file','Connection refused']):raise
+        except (RuntimeError,json.JSONDecodeError) as e:
+            if not (isinstance(e,json.JSONDecodeError) or any(t in str(e) for t in ['No such file','Connection refused'])):raise
         else:
             if current.get('stopping'):raise RuntimeError('上次停止已锁定代理，请执行关闭程序后重新启动')
+            if self.config.get('container')=='diff-planner' and 'exploration-context-v1' not in current.get('capabilities',[]):
+                raise RuntimeError('机载代理需更新探索任务衔接；着陆且未解锁时先关闭程序，再重新启动')
             if 'flight-v2' not in current.get('capabilities',[]):raise RuntimeError('机载代理需更新坐标与跳点功能；着陆且未解锁时先关闭程序，再重新启动')
             return current
         destination='/home/'+self.config['user']+'/.fast-drone-ground-station'
         self.shell('mkdir -p '+shlex.quote(destination))
         sftp=self.client.open_sftp()
         try:
-            for name in ('agent.py','mission.py','geo.py','fence.py','visualization.py','flight_parameters.py'):
+            for name in ('agent.py','mission.py','geo.py','fence.py','visualization.py','flight_parameters.py','exploration_geometry.py','exploration_session.py'):
                 sftp.put(str(ROOT/'onboard'/name),destination+'/'+name)
         finally:sftp.close()
         self.shell('docker exec '+self.container+' mkdir -p /tmp/ground_station')
-        for name in ('agent.py','mission.py','geo.py','fence.py','visualization.py','flight_parameters.py'):
+        for name in ('agent.py','mission.py','geo.py','fence.py','visualization.py','flight_parameters.py','exploration_geometry.py','exploration_session.py'):
             self.shell('docker cp '+shlex.quote(destination+'/'+name)+' '+self.container+':/tmp/ground_station/'+name)
         launch='exec python3 '+AGENT+' serve --aircraft '+str(int(self.config['id']))+' > /tmp/ground_station/agent.log 2>&1'
         self.shell('docker exec -d '+self.container+' '+ENTRY+' bash -c '+shlex.quote(launch))

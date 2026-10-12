@@ -7,7 +7,7 @@ except ImportError:
     from fence import Fence, xy
     from flight_parameters import DEFAULTS, validate, validate_diff, map_limits
 
-TERMINAL = {'IDLE', 'COMPLETE', 'ERROR', 'MANUAL'}
+TERMINAL = {'IDLE', 'COMPLETE', 'ABORTED', 'ERROR', 'MANUAL'}
 
 
 class Mission:
@@ -16,6 +16,9 @@ class Mission:
         self.flight_height = self.parameters["takeoff_height"]
         self.map_limits = map_limits(self.parameters, rolling_map)
         self.bounds = [self.map_limits[1],self.map_limits[3]]
+        self.exploration_enabled = False
+        self.returned_home = False
+        self.completed_outbound = False
         self.phase = 'IDLE'
         self.reason = ''
         self.points = []
@@ -93,6 +96,9 @@ class Mission:
         self.visited=[[pos[0],pos[1],self.flight_height]]
         self.points, self.home, self.index = validated, [pos[0], pos[1], self.flight_height], 0
         self.seen_offboard = False
+        self.returned_home = False
+        self.completed_outbound = False
+        if self.exploration_enabled:self.index=len(self.points)-1
         self.transition('ARMING', now)
         return [('controller_start', None), ('arm', None)]
 
@@ -173,7 +179,8 @@ class Mission:
         fresh = state.get('fresh', False)
         if self.phase in {'LAND_REQUESTED', 'LANDING'}:
             if fresh and state.get('landed') and not state.get('armed'):
-                self.transition('COMPLETE', now, self.reason)
+                phase='ABORTED' if self.exploration_enabled and not (self.returned_home and self.completed_outbound) else 'COMPLETE'
+                self.transition(phase, now, self.reason)
                 return [('controller_stop', None)]
             if self.phase == 'LAND_REQUESTED':
                 if fresh and state.get('mode') == 'AUTO.LAND':
@@ -220,7 +227,7 @@ class Mission:
             if state.get('mode') == 'OFFBOARD':
                 self.seen_offboard = True
             if state.get('mode') == 'OFFBOARD' and self.stable(state, self.home, now):
-                return self.send_goal(self.points[0], state, now, 'OUTBOUND')
+                return self.send_goal(self.points[self.index], state, now, 'OUTBOUND')
             if now-self.since > 30:
                 self.transition('LAND_REQUESTED', now, '起飞超时，请求降落')
                 return [('land', None)]
@@ -233,14 +240,18 @@ class Mission:
                 if self.phase == 'RETURNING':
                     if self.return_points and self.return_index+1<len(self.return_points):
                         self.return_index+=1;return self.send_goal(self.return_points[self.return_index],state,now,'RETURNING')
+                    self.returned_home=True
                     self.transition('LAND_REQUESTED', now, '已返回起飞点，自动降落')
                     return [('land', None)]
                 self.visited.append(list(self.points[self.index]))
                 self.index += 1
                 if self.index == len(self.points):
+                    self.completed_outbound=True
                     self.return_index=0
                     return self.send_goal(self.return_points[0] if self.return_points else self.home, state, now, 'RETURNING')
                 return self.send_goal(self.points[self.index], state, now, 'OUTBOUND')
+            # The explorer owns local retries; unknown space cannot count as completing a target.
+            if self.exploration_enabled:return []
             reason=''
             if now-self.since>3 and state.get('command_age',0)>3:reason='有效跟踪指令中断超过 3 秒'
             elif now-self.progress_time>max(10.,2.+.9/self.parameters['max_vel']) and math.dist(state['position'],target)>.45:reason='持续位置无进展'

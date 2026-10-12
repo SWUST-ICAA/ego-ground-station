@@ -3,8 +3,23 @@ import math
 import time
 import numpy as np
 from OpenGL import GL as G
+from OpenGL import error as gl_error
 from PyQt5 import QtCore, QtGui, QtWidgets as W
 from onboard.visualization import unpack_voxels
+
+
+def _packet_frame(packet):
+    """Read frame metadata from packed grids; old agents send point lists."""
+    return packet.get('frame') if isinstance(packet, dict) else None
+
+
+def _legacy_points(packet):
+    if not isinstance(packet, list):
+        return None
+    points = np.asarray(packet, dtype=np.float32).reshape(-1, 3)
+    if len(points) and not np.isfinite(points).all():
+        raise ValueError('旧版规划器点云包含无效坐标')
+    return points
 
 
 def voxel_mesh(mask,origin,resolution,color):
@@ -37,7 +52,7 @@ class CloudCanvas(W.QOpenGLWidget):
         super().__init__()
         fmt=QtGui.QSurfaceFormat();fmt.setVersion(2,1);fmt.setDepthBufferSize(24);self.setFormat(fmt)
         self.aircraft=None;self.data={};self.received=0.;self.layer='voxel_map';self.slice=False
-        self.drag=None;self.meshes=[];self.render_error='';self.raw=np.empty((0,3),np.float32)
+        self.drag=None;self.meshes=[];self.render_error='';self.gl_error='';self.raw=np.empty((0,3),np.float32)
         self.reset_view();self.setMinimumSize(250,240)
         self.timer=QtCore.QTimer(self);self.timer.timeout.connect(self.update);self.timer.start(500)
 
@@ -65,17 +80,35 @@ class CloudCanvas(W.QOpenGLWidget):
     def age(self,value):return None if value is None else value+max(0.,time.monotonic()-self.received)
 
     def rebuild(self):
-        self.meshes=[];self.render_error=''
+        self.meshes=[];self.render_error='';self.gl_error=''
         try:
             keys=['voxel_map','voxel_inflated'] if self.layer=='both' else [self.layer]
-            frames={self.data[k].get('frame') for k in keys if k in self.data}
+            frames={_packet_frame(self.data[k]) for k in keys if k in self.data}
             if len(frames)>1:raise ValueError('两层坐标系不同，已暂停叠加')
             for key in keys:
                 if key not in ('voxel_map','voxel_inflated'):continue
                 packet=self.data.get(key)
+                # Legacy EGO agents expose the obstacle map as ``inflated``
+                # instead of the packed voxel layers used by newer agents.
+                inflated=self.data.get('inflated')
+                if packet is None and isinstance(inflated, list) and inflated:
+                    if self.layer != 'both' or key == 'voxel_map':
+                        packet=inflated
                 if packet is None:
                     if self.data.get(key+'_error'):raise ValueError(self.data[key+'_error'])
                     continue
+                legacy=_legacy_points(packet)
+                if legacy is not None:
+                    if self.slice:
+                        height=self.data.get('target_height',0.)
+                        legacy=legacy[np.abs(legacy[:,2]-height)<=.5]
+                    color=(.30,.70,.90) if key=='voxel_map' else (1.,.63,.25)
+                    self.meshes.append(dict(key=key,vertices=legacy,
+                                            colors=np.tile(np.asarray(color,np.float32),(len(legacy),1)),
+                                            points=True,count=len(legacy),resolution=0.,age=0.))
+                    continue
+                if not isinstance(packet, dict):
+                    raise ValueError(f'{key} 数据格式无效')
                 mask,origin,res=unpack_voxels(packet)
                 if self.slice and mask.size:
                     height=self.data.get('target_height',0.)
@@ -87,6 +120,14 @@ class CloudCanvas(W.QOpenGLWidget):
             self.raw=np.asarray(self.data.get('cloud',[]),np.float32).reshape(-1,3)
             self.raw=self.raw[np.isfinite(self.raw).all(axis=1)]
             if self.slice:self.raw=self.raw[np.abs(self.raw[:,2]-self.data.get('target_height',0.))<=.5]
+            # Some legacy planners publish only the live radar cloud. Keep the
+            # obstacle layers useful by showing that cloud when their map is empty.
+            if self.layer in ('voxel_map','voxel_inflated') and not any(m['count'] for m in self.meshes) and len(self.raw):
+                color=(.30,.70,.90) if self.layer=='voxel_map' else (1.,.63,.25)
+                self.meshes.append(dict(key=self.layer,vertices=self.raw,
+                                        colors=np.tile(np.asarray(color,np.float32),(len(self.raw),1)),
+                                        points=True,count=len(self.raw),resolution=0.,
+                                        age=self.data.get('cloud_age_sec')))
         except (ValueError,KeyError,TypeError) as e:self.render_error=str(e);self.meshes=[]
         self.update()
 
@@ -94,12 +135,19 @@ class CloudCanvas(W.QOpenGLWidget):
 
     def draw_arrays(self,vertices,colors,mode):
         if not len(vertices):return
-        G.glEnableClientState(G.GL_VERTEX_ARRAY);G.glEnableClientState(G.GL_COLOR_ARRAY)
-        G.glVertexPointer(3,G.GL_FLOAT,0,vertices);G.glColorPointer(3,G.GL_FLOAT,0,colors)
-        G.glDrawArrays(mode,0,len(vertices))
-        G.glDisableClientState(G.GL_COLOR_ARRAY);G.glDisableClientState(G.GL_VERTEX_ARRAY)
+        try:
+            G.glEnableClientState(G.GL_VERTEX_ARRAY);G.glEnableClientState(G.GL_COLOR_ARRAY)
+            G.glVertexPointer(3,G.GL_FLOAT,0,vertices);G.glColorPointer(3,G.GL_FLOAT,0,colors)
+            G.glDrawArrays(mode,0,len(vertices))
+            G.glDisableClientState(G.GL_COLOR_ARRAY);G.glDisableClientState(G.GL_VERTEX_ARRAY)
+        except gl_error.Error as e:
+            # WSLg/Qt can invalidate the native context during a repaint.
+            self.gl_error=str(e) or 'OpenGL 上下文无效'
+            return
 
     def paintGL(self):
+        context=self.context()
+        if not self.isValid() or context is None or not context.isValid():return
         G.glClear(G.GL_COLOR_BUFFER_BIT|G.GL_DEPTH_BUFFER_BIT);G.glEnable(G.GL_DEPTH_TEST)
         G.glDisable(G.GL_LIGHTING);G.glDisable(G.GL_CULL_FACE);G.glDisable(G.GL_BLEND)
         scale=max(20,min(self.width(),self.height()))/14.*self.zoom
@@ -143,12 +191,29 @@ class CloudCanvas(W.QOpenGLWidget):
                 end=list(position);end[axis]+=.8;G.glColor3f(*color);G.glVertex3f(*position);G.glVertex3f(*end)
             G.glEnd()
         G.glDisable(G.GL_DEPTH_TEST)
+
+    def _summarize(self):
+        d=self.data
+        def fmt(v):
+            if v is None:return '无'
+            if isinstance(v,list):return f'点({len(v)})'
+            if isinstance(v,dict) and 'shape' in v:return f'栅格({v.get("count",0)})'
+            if isinstance(v,dict):return '字典'
+            return type(v).__name__
+        parts=[f'{k}={fmt(d.get(k))}' for k in ('voxel_map','voxel_inflated','inflated','cloud')]
+        parts.append('position='+('有' if d.get('position') else '无'))
+        errs=[k for k in ('voxel_map_error','voxel_inflated_error') if d.get(k)]
+        if errs:parts.append('错误='+'; '.join(f'{k}={d[k]}' for k in errs))
+        return '观测: '+'  '.join(parts)
+
     def status_text(self):
         count=sum(m['count'] for m in self.meshes if self.age(m['age']) is not None and self.age(m['age'])<=2)
         if self.layer=='cloud':count=len(self.raw) if self.age(self.data.get('cloud_age_sec')) is not None and self.age(self.data.get('cloud_age_sec'))<=2 else 0
         def age_text(key):
             age=self.age(self.data.get(key));return '—' if age is None else f'{age:.1f}'
-        message=self.data.get('error') or self.render_error or ('所选图层暂无新鲜数据，或显示范围内无障碍' if self.data and not count else '')
+        message=self.data.get('error') or self.render_error or (('OpenGL 绘制失败：'+self.gl_error) if self.gl_error else '') or ('所选图层暂无新鲜数据，或显示范围内无障碍' if self.data and not count else '')
+        if not count and self.data:
+            message=(message+'\n' if message else '')+self._summarize()
         geometry=f"原始栅格 {self.data.get('resolution',0.):.3f} m · 蓝色：障碍 · 橙色：膨胀 · 红线：规划轨迹"
         if any(m['points'] for m in self.meshes):geometry+=' · 高密度：全部格中心点显示'
         if self.slice:geometry=f"显示切片：目标高度 {self.data.get('target_height',0.):.2f} ±0.50 m；规划器障碍不变"
